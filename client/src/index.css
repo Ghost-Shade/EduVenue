@@ -1,0 +1,71 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/*
+ * Global base layer.
+ *
+ * Accessibility notes:
+ *  - Focus is never fully removed. `:focus-visible` gets a visible ring so
+ *    keyboard navigation is always trackable.
+ *  - `prefers-reduced-motion` disables the few transitions we use. This is set
+ *    globally rather than per-component so a new component cannot forget it.
+ */
+@layer base {
+  html {
+    -webkit-text-size-adjust: 100%;
+  }
+
+  body {
+    @apply bg-campus-50 text-campus-800 antialiased;
+    font-feature-settings: 'cv11', 'ss01';
+  }
+
+  h1,
+  h2,
+  h3,
+  h4 {
+    @apply text-campus-900 font-semibold tracking-tight;
+  }
+
+  /* Consistent, always-visible keyboard focus. */
+  :focus-visible {
+    @apply outline-none ring-2 ring-brand-600 ring-offset-2 ring-offset-white;
+  }
+
+  /* Numeric inputs and time displays should not jitter as digits change. */
+  .tabular {
+    font-variant-numeric: tabular-nums;
+  }
+}
+
+@layer components {
+  /* Shared card surface used by facility cards, panels and stat tiles. */
+  .surface {
+    @apply bg-white border border-campus-200 rounded-xl shadow-card;
+  }
+
+  /* Screen-reader-only, but still focusable (used by skip links). */
+  .visually-hidden {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    margin: -1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    white-space: nowrap;
+    border-width: 0;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}

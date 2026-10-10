@@ -1,63 +1,97 @@
 /**
  * Reset the database to a clean, freshly seeded state.
  *
- * Deletes the database file (including its write-ahead log companions), applies
- * the schema, then seeds the demo dataset. This is the command to run when the
- * demo data has been edited into a confusing state during rehearsal.
+ * Drops every table, applies the schema, then seeds the demo dataset. This is
+ * the command to run when the demo data has been edited into a confusing state
+ * during rehearsal.
  *
  * Run with:  npm run db:reset
  *
- * Refuses to run against the test database when NODE_ENV is not 'test' only in
- * the sense that it always targets whatever the current configuration points
- * at - so check which file is printed before confirming.
+ * ===========================================================================
+ * IT REFUSES TO RUN AGAINST A REMOTE DATABASE WITHOUT --force
+ * ===========================================================================
+ *
+ * The SQLite version of this script deleted a file, which was safe because the
+ * file was always on this machine. `DATABASE_URL` is now a full connection
+ * string, and it is entirely possible to have the Neon URL for a deployed
+ * instance exported in the same shell. Running this against it would drop the
+ * tables behind a live site.
+ *
+ * So a host that is not local is refused unless `--force` is passed explicitly:
+ *
+ *     npm run db:reset -- --force
+ *
+ * The check is on the HOSTNAME, not on a flag, so it works even when nobody
+ * remembered to set NODE_ENV.
  */
-import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 import { getConfig } from '../config.ts'
-import { openDatabase } from './connection.ts'
-import { applySchema } from './migrate.ts'
-import { seedDatabase, DEMO_PASSWORD } from './seed.ts'
+import { closePool, redactDatabaseUrl, waitForDatabase } from './connection.ts'
+import { applySchema, dropAllTables, listIndexes, listTables } from './migrate.ts'
+import { DEMO_PASSWORD, seedDatabase } from './seed.ts'
 
-function removeDatabaseFiles(databaseFile: string): void {
-  if (databaseFile === ':memory:') {
-    // Nothing to delete; an in-memory database vanishes with the process.
-    return
-  }
+/** Hosts that are certainly this machine. */
+const LOCAL_HOSTS = new Set(['localhost', '127.0.0.1', '::1', 'host.docker.internal'])
 
-  // WAL mode keeps a -wal and a -shm file beside the database. Deleting only
-  // the main file would leave committed transactions behind in the log, which
-  // SQLite would then replay into the fresh database - producing a reset that
-  // silently did not reset.
-  const companions = [databaseFile, `${databaseFile}-wal`, `${databaseFile}-shm`]
-
-  for (const file of companions) {
-    if (fs.existsSync(file)) {
-      fs.rmSync(file)
-      console.log(`Removed ${path.basename(file)}`)
-    }
+function isLocalDatabase(connectionString: string): boolean {
+  try {
+    const host = new URL(connectionString).hostname
+    return LOCAL_HOSTS.has(host) || host.endsWith('.local')
+  } catch {
+    return false
   }
 }
 
-function main(): void {
+async function main(): Promise<void> {
   const config = getConfig()
+  const force = process.argv.includes('--force')
 
-  console.log(`Resetting: ${config.databaseFile}`)
-  removeDatabaseFiles(config.databaseFile)
+  console.log(`Resetting: ${redactDatabaseUrl(config.databaseUrl)}`)
 
-  const db = openDatabase(config.databaseFile)
-  try {
-    applySchema(db)
-    console.log('Schema applied.')
+  if (!isLocalDatabase(config.databaseUrl) && !force) {
+    throw new Error(
+      'That DATABASE_URL points at a remote host, and this command DROPS EVERY TABLE.\n' +
+        'If you are certain, run it again with --force:\n\n' +
+        '  npm run db:reset -- --force\n',
+    )
+  }
 
-    seedDatabase(db)
-    console.log('Sample data seeded.')
-    console.log('')
-    console.log(`Demo password for all accounts: ${DEMO_PASSWORD}`)
-    console.log('Reset complete.')
-  } finally {
-    db.close()
+  await waitForDatabase()
+
+  await dropAllTables()
+  console.log('Dropped existing tables.')
+
+  await applySchema()
+  console.log('Schema applied.')
+
+  await seedDatabase()
+  console.log('Sample data seeded.')
+
+  const tables = await listTables()
+  const indexes = await listIndexes()
+
+  // Called out explicitly rather than left to the index list: this constraint is
+  // the entire no-overlap guarantee, and a reset that silently installed
+  // everything except it would look perfectly healthy until two bookings raced.
+  const hasOverlapConstraint = indexes.includes('bookings_no_overlap')
+
+  console.log('')
+  console.log(`Tables:             ${tables.length}`)
+  console.log(`Indexes:            ${indexes.length}`)
+  console.log(
+    `Overlap constraint: ${hasOverlapConstraint ? 'installed (bookings_no_overlap)' : 'MISSING - this is a bug'}`,
+  )
+  console.log('')
+  console.log(`Demo password for all accounts: ${DEMO_PASSWORD}`)
+  console.log('Reset complete.')
+
+  if (!hasOverlapConstraint) {
+    throw new Error(
+      'The bookings_no_overlap exclusion constraint was not created. ' +
+        'The no-overlap guarantee is NOT in place - investigate before using this database.',
+    )
   }
 }
 
@@ -67,10 +101,12 @@ const invokedDirectly =
 
 if (invokedDirectly) {
   try {
-    main()
+    await main()
   } catch (error) {
     console.error('\nReset failed.')
     console.error(error instanceof Error ? error.message : error)
     process.exitCode = 1
+  } finally {
+    await closePool()
   }
 }

@@ -6,28 +6,41 @@
  * ===========================================================================
  *
  * The requirement is that two confirmed bookings can never overlap for the same
- * facility, even when two representatives submit at the same moment. That is
- * provided by two things working together, and NOT by any check the client
- * performs:
+ * facility, even when two representatives submit at the same moment.
  *
- *   1. EVERY write runs inside `inImmediateTransaction`, which issues
- *      BEGIN IMMEDIATE. The write lock is taken at the START of the
- *      transaction, so a second request waits rather than reading the
- *      pre-state and proceeding on stale data.
+ * THAT IS NOW PROVIDED BY THE DATABASE, NOT BY THIS FILE.
  *
- *   2. better-sqlite3 is synchronous and Node is single-threaded, so the
- *      transaction body cannot be interrupted by another request. The
- *      "check, then insert" sequence is therefore genuinely atomic.
+ * `bookings_no_overlap` in schema.sql is an exclusion constraint over
+ * `(facility_id, tstzrange(effective_start, effective_end))`, restricted to
+ * confirmed rows. PostgreSQL enforces it inside a GiST index, at the moment of
+ * the insert, for every connection from every process and every host. There is
+ * no window to race and nothing here has to be careful for it to hold.
  *
- * The practical consequence: the second of two simultaneous bookings observes
- * the first one's committed row at step 5 and is rejected. It does not silently
- * overwrite, and it does not create a duplicate.
+ * The previous SQLite build could not do that - SQLite has no exclusion
+ * constraint - so it relied on BEGIN IMMEDIATE plus a synchronous driver to
+ * serialise "check for a conflict" against "insert". That worked, but only
+ * inside one process; two instances would each hold their own lock and could
+ * both accept the same slot. The constraint removes that limitation rather than
+ * working around it.
  *
- * HONEST LIMITATION: this holds for a single server process. It would not hold
- * across multiple processes or hosts. The README documents the PostgreSQL
- * `EXCLUDE USING gist` constraint that a real deployment would use instead,
- * which enforces the same rule inside the index and therefore survives
- * horizontal scaling.
+ * ===========================================================================
+ * SO WHY DOES THIS FILE STILL CHECK?
+ * ===========================================================================
+ *
+ * Because a constraint violation is a terrible thing to show a user. The
+ * database can say "23P01: conflicting key value violates exclusion constraint
+ * bookings_no_overlap" and nothing else. It cannot name the session that got
+ * there first, nor suggest a different time.
+ *
+ * So the checks below run first and produce the useful message. They are a
+ * COURTESY, not the guarantee:
+ *
+ *   - If they pass and the constraint then refuses the insert, that is a
+ *     genuine race, and `createBooking` catches the failure and re-describes it
+ *     in the same shape the check would have used. A user cannot tell which
+ *     path rejected them, which is the point.
+ *   - If they were somehow removed entirely, the guarantee would still hold.
+ *     That is what makes it a guarantee.
  *
  * ===========================================================================
  * VALIDATION ORDER
@@ -40,7 +53,14 @@
  */
 import { randomUUID } from 'node:crypto'
 
-import { getDb, inImmediateTransaction, nowIso } from '../db/connection.ts'
+import {
+  asInstant,
+  asInstantIso,
+  db,
+  isOverlapViolation,
+  withTransaction,
+  type Queryable,
+} from '../db/connection.ts'
 import {
   activityNotPermitted,
   bookingConflict,
@@ -54,7 +74,7 @@ import {
   ApiError,
   type ApiErrorCode,
 } from '../lib/errors.ts'
-import { assertValidInterval, findFirstConflict, type Interval } from '../lib/overlap.ts'
+import { assertValidInterval, bufferWindow, findFirstConflict, type Interval } from '../lib/overlap.ts'
 import { roleAtLeast, type UserRole } from '../lib/roles.ts'
 import {
   addMinutes,
@@ -101,6 +121,12 @@ export interface CreateBookingInput {
   endTime: string
 }
 
+/**
+ * A row as the driver returns it. Timestamps are `Date`, because the columns are
+ * `timestamptz` - they are converted to ISO strings in `mapBooking` so that the
+ * HTTP contract is byte-for-byte what it was under SQLite and the client needs
+ * no change at all.
+ */
 interface RawBookingRow {
   id: string
   booking_reference: string
@@ -112,12 +138,12 @@ interface RawBookingRow {
   booked_by_name: string
   activity_purpose: string
   expected_attendance: number
-  start_time: string
-  end_time: string
+  start_time: Date
+  end_time: Date
   status: string
-  created_at: string
-  updated_at: string
-  cancelled_at: string | null
+  created_at: Date
+  updated_at: Date
+  cancelled_at: Date | null
   cancelled_by_name: string | null
   cancellation_reason: string | null
 }
@@ -160,23 +186,26 @@ function mapBooking(row: RawBookingRow): BookingRecord {
     bookedByName: row.booked_by_name,
     activityPurpose: row.activity_purpose,
     expectedAttendance: row.expected_attendance,
-    startTime: row.start_time,
-    endTime: row.end_time,
-    durationMinutes: durationMinutes(new Date(row.start_time), new Date(row.end_time)),
+    startTime: asInstantIso(row.start_time),
+    endTime: asInstantIso(row.end_time),
+    durationMinutes: durationMinutes(asInstant(row.start_time), asInstant(row.end_time)),
     status: row.status as BookingStatus,
-    createdAt: row.created_at,
-    updatedAt: row.updated_at,
-    cancelledAt: row.cancelled_at,
+    createdAt: asInstantIso(row.created_at),
+    updatedAt: asInstantIso(row.updated_at),
+    cancelledAt: row.cancelled_at === null ? null : asInstantIso(row.cancelled_at),
     cancelledByName: row.cancelled_by_name,
     cancellationReason: row.cancellation_reason,
   }
 }
 
 /** Loads one booking, or throws a 404. */
-export function getBookingOrThrow(bookingId: string): BookingRecord {
-  const row = getDb().prepare(`${SELECT_BOOKING} where b.id = ?`).get(bookingId) as
-    | RawBookingRow
-    | undefined
+export async function getBookingOrThrow(
+  bookingId: string,
+  q: Queryable = db,
+): Promise<BookingRecord> {
+  const row = await q.queryOne<RawBookingRow>(`${SELECT_BOOKING} where b.id = @bookingId`, {
+    bookingId,
+  })
 
   if (!row) {
     throw notFound('That booking does not exist.')
@@ -195,8 +224,12 @@ export type BookingScope = 'upcoming' | 'past' | 'all'
  * something needs to be able to see that they did, otherwise the booking
  * appears to have vanished.
  */
-export function listBookingsForUser(userId: string, scope: BookingScope = 'all'): BookingRecord[] {
-  const now = nowIso()
+export async function listBookingsForUser(
+  userId: string,
+  scope: BookingScope = 'all',
+  q: Queryable = db,
+): Promise<BookingRecord[]> {
+  const now = new Date()
 
   const scopeClause =
     scope === 'upcoming'
@@ -206,31 +239,36 @@ export function listBookingsForUser(userId: string, scope: BookingScope = 'all')
         : ''
 
   const order =
-    scope === 'upcoming' ? 'b.start_time asc' : scope === 'past' ? 'b.start_time desc' : 'b.start_time desc'
+    scope === 'upcoming'
+      ? 'b.start_time asc'
+      : scope === 'past'
+        ? 'b.start_time desc'
+        : 'b.start_time desc'
 
-  const rows = getDb()
-    .prepare(`${SELECT_BOOKING} where b.booked_by = @userId ${scopeClause} order by ${order}`)
-    .all({ userId, now }) as RawBookingRow[]
+  const rows = await q.query<RawBookingRow>(
+    `${SELECT_BOOKING} where b.booked_by = @userId ${scopeClause} order by ${order}`,
+    { userId, now },
+  )
 
   return rows.map(mapBooking)
 }
 
-/** Confirmed bookings for a facility that overlap a window. Used by the admin schedule view. */
-export function listFacilityBookings(
+/** Confirmed bookings for a facility over a window. Used by the admin schedule view. */
+export async function listFacilityBookings(
   facilityId: string,
-  fromIso: string,
-  toIso: string,
-): BookingRecord[] {
-  const rows = getDb()
-    .prepare(
-      `${SELECT_BOOKING}
-        where b.facility_id = @facilityId
-          and b.status = 'confirmed'
-          and b.start_time < @toIso
-          and b.end_time > @fromIso
-        order by b.start_time asc`,
-    )
-    .all({ facilityId, fromIso, toIso }) as RawBookingRow[]
+  from: Date,
+  to: Date,
+  q: Queryable = db,
+): Promise<BookingRecord[]> {
+  const rows = await q.query<RawBookingRow>(
+    `${SELECT_BOOKING}
+      where b.facility_id = @facilityId
+        and b.status = 'confirmed'
+        and b.start_time < @to
+        and b.end_time > @from
+      order by b.start_time asc`,
+    { facilityId, from, to },
+  )
 
   return rows.map(mapBooking)
 }
@@ -334,10 +372,10 @@ function assertOpenForInterval(
   const weekday = new Date(start.getTime() + 12 * 60 * 60 * 1000).getUTCDay()
 
   if (facility.closedDays.includes(weekday)) {
-    throw facilityUnavailable(
-      `${facility.name} does not operate on that day of the week.`,
-      { facilityId: facility.id, closedDays: facility.closedDays },
-    )
+    throw facilityUnavailable(`${facility.name} does not operate on that day of the week.`, {
+      facilityId: facility.id,
+      closedDays: facility.closedDays,
+    })
   }
 
   if (!isWithinOperatingHours(start, end, facility.opensAt, facility.closesAt)) {
@@ -363,40 +401,55 @@ function assertOpenForInterval(
  * of obstruction: a block is a decision by the university, and the message the
  * user sees should say so rather than implying someone else booked the room.
  */
-function assertNotBlocked(facilityId: string, start: Date, end: Date): void {
-  const block = getDb()
-    .prepare(
-      `select id, reason, start_time, end_time
-         from facility_blocks
-        where facility_id = @facilityId
-          and start_time < @endTime
-          and end_time > @startTime
-        order by start_time asc
-        limit 1`,
-    )
-    .get({
-      facilityId,
-      startTime: start.toISOString(),
-      endTime: end.toISOString(),
-    }) as { id: string; reason: string; start_time: string; end_time: string } | undefined
+async function assertNotBlocked(
+  q: Queryable,
+  facilityId: string,
+  start: Date,
+  end: Date,
+): Promise<void> {
+  const block = await q.queryOne<{
+    id: string
+    reason: string
+    start_time: Date
+    end_time: Date
+  }>(
+    `select id, reason, start_time, end_time
+       from facility_blocks
+      where facility_id = @facilityId
+        and start_time < @endTime
+        and end_time > @startTime
+      order by start_time asc
+      limit 1`,
+    { facilityId, startTime: start, endTime: end },
+  )
 
   if (block) {
     throw facilityUnavailable(
       `That time is unavailable because the facility is blocked: ${block.reason} ` +
-        `(${formatForDisplay(new Date(block.start_time))} to ${formatForDisplay(new Date(block.end_time))}).`,
+        `(${formatForDisplay(asInstant(block.start_time))} to ` +
+        `${formatForDisplay(asInstant(block.end_time))}).`,
       {
         facilityId,
         blockId: block.id,
         reason: block.reason,
-        startTime: block.start_time,
-        endTime: block.end_time,
+        startTime: asInstantIso(block.start_time),
+        endTime: asInstantIso(block.end_time),
       },
     )
   }
 }
 
+/** An existing confirmed booking that blocks the requested interval. */
+interface BlockingBooking {
+  id: string
+  reference: string
+  purpose: string
+  start: Date
+  end: Date
+}
+
 /**
- * Confirms no confirmed booking overlaps the requested interval.
+ * Finds the confirmed booking that blocks the requested interval, if any.
  *
  * The SQL below is the buffer-aware form of the half-open overlap predicate in
  * lib/overlap.ts. A conflict exists when:
@@ -411,74 +464,107 @@ function assertNotBlocked(facilityId: string, start: Date, end: Date): void {
  *
  * The unit tests in tests/overlap.test.ts pin the same rule as a pure function.
  * If these two ever disagree, the tests are the ones that are right.
+ *
+ * NOTE: this is the same predicate the exclusion constraint applies, expressed
+ * differently. The constraint widens each stored row by half the buffer and
+ * compares ranges; this widens the query bounds by the whole buffer and compares
+ * instants. `tests/overlapConstraint.test.ts` pins the two against each other.
  */
-function assertNoOverlappingBooking(
+async function findOverlappingBooking(
+  q: Queryable,
   facility: FacilityRecord,
   start: Date,
   end: Date,
-): void {
+): Promise<BlockingBooking | null> {
   const buffer = facility.bufferMinutes
 
-  const rows = getDb()
-    .prepare(
-      `select id, booking_reference, activity_purpose, start_time, end_time
-         from bookings
-        where facility_id = @facilityId
-          and status = 'confirmed'
-          and start_time < @limitEnd
-          and end_time > @limitStart
-        order by start_time asc`,
-    )
-    .all({
-      facilityId: facility.id,
-      limitStart: addMinutes(start, -buffer).toISOString(),
-      limitEnd: addMinutes(end, buffer).toISOString(),
-    }) as Array<{
+  const rows = await q.query<{
     id: string
     booking_reference: string
     activity_purpose: string
-    start_time: string
-    end_time: string
-  }>
+    start_time: Date
+    end_time: Date
+  }>(
+    `select id, booking_reference, activity_purpose, start_time, end_time
+       from bookings
+      where facility_id = @facilityId
+        and status = 'confirmed'
+        and start_time < @limitEnd
+        and end_time > @limitStart
+      order by start_time asc`,
+    {
+      facilityId: facility.id,
+      limitStart: addMinutes(start, -buffer),
+      limitEnd: addMinutes(end, buffer),
+    },
+  )
 
   const existing: Array<Interval & { reference: string; purpose: string; id: string }> = rows.map(
     (row) => ({
       id: row.id,
       reference: row.booking_reference,
       purpose: row.activity_purpose,
-      start: new Date(row.start_time),
-      end: new Date(row.end_time),
+      start: asInstant(row.start_time),
+      end: asInstant(row.end_time),
     }),
   )
 
   // The candidate is tested against the un-buffered interval; the buffer is
   // already applied by the widened SQL bounds above. Passing it again here
   // would apply it twice and reject bookings that are actually legal.
-  const blocking = findFirstConflict({ start, end }, existing, 0)
+  return findFirstConflict({ start, end }, existing, 0)
+}
+
+/** Builds the 409 a blocked booking request should produce. */
+function conflictError(facility: FacilityRecord, blocking: BlockingBooking | null): ApiError {
+  const bufferNote =
+    facility.bufferMinutes > 0
+      ? ` ${facility.name} also requires a ${facility.bufferMinutes}-minute gap between ` +
+        `bookings for preparation.`
+      : ''
+
+  // The database refused the insert but the offending row is not visible to a
+  // re-query - which can only happen if it was cancelled in the moment between
+  // the two. The request still cannot be granted, and the caller still deserves
+  // a 409 rather than an unexplained 500, so a generic conflict is raised.
+  if (!blocking) {
+    return bookingConflict(
+      `${facility.name} was taken for that time by someone else a moment ago.${bufferNote} ` +
+        `Choose a different time, or ask the app to suggest an alternative.`,
+      { facilityId: facility.id, facilityName: facility.name, bufferMinutes: facility.bufferMinutes },
+    )
+  }
+
+  return bookingConflict(
+    `${facility.name} is already booked from ${formatForDisplay(blocking.start)} to ` +
+      `${formatForDisplay(blocking.end)} (${blocking.purpose}).${bufferNote} ` +
+      `Choose a different time, or ask the app to suggest an alternative.`,
+    {
+      facilityId: facility.id,
+      facilityName: facility.name,
+      bufferMinutes: facility.bufferMinutes,
+      conflicting: {
+        bookingId: blocking.id,
+        reference: blocking.reference,
+        activityPurpose: blocking.purpose,
+        startTime: blocking.start.toISOString(),
+        endTime: blocking.end.toISOString(),
+      },
+    },
+  )
+}
+
+/** Confirms no confirmed booking overlaps the requested interval. */
+async function assertNoOverlappingBooking(
+  q: Queryable,
+  facility: FacilityRecord,
+  start: Date,
+  end: Date,
+): Promise<void> {
+  const blocking = await findOverlappingBooking(q, facility, start, end)
 
   if (blocking) {
-    const bufferNote =
-      buffer > 0
-        ? ` ${facility.name} also requires a ${buffer}-minute gap between bookings for preparation.`
-        : ''
-
-    throw bookingConflict(
-      `${facility.name} is already booked from ${formatForDisplay(blocking.start)} to ` +
-        `${formatForDisplay(blocking.end)} (${blocking.purpose}).${bufferNote} ` +
-        `Choose a different time, or ask the app to suggest an alternative.`,
-      {
-        facilityId: facility.id,
-        facilityName: facility.name,
-        bufferMinutes: buffer,
-        conflicting: {
-          bookingId: blocking.id,
-          reference: blocking.reference,
-          activityPurpose: blocking.purpose,
-          startTime: blocking.start.toISOString(),
-          endTime: blocking.end.toISOString(),
-        },
-      },
-    )
+    throw conflictError(facility, blocking)
   }
 }
 
@@ -489,15 +575,25 @@ function assertNoOverlappingBooking(
 /**
  * Allocates the next human-readable booking reference.
  *
- * Uses a dedicated AUTOINCREMENT table rather than MAX(id) + 1 or a count,
- * because AUTOINCREMENT never reuses a value even after deletions. A reference
- * shown to a user can therefore never later be reassigned to a different
- * booking - which matters in a system whose entire purpose is trustworthy
- * booking records.
+ * Uses a dedicated identity column rather than MAX(id) + 1 or a count, because
+ * an identity never reuses a value even after deletions. A reference shown to a
+ * user can therefore never later be reassigned to a different booking - which
+ * matters in a system whose entire purpose is trustworthy booking records.
+ *
+ * `returning id` replaces SQLite's `lastInsertRowid`; there is no equivalent
+ * property in `pg`, and reading the value back in the same statement is both
+ * shorter and immune to another session's insert being counted instead.
  */
-function nextBookingReference(localYear: string): string {
-  const info = getDb().prepare('insert into booking_reference_seq default values').run()
-  const sequence = Number(info.lastInsertRowid)
+async function nextBookingReference(tx: Queryable, localYear: string): Promise<string> {
+  const row = await tx.queryOne<{ id: number }>(
+    'insert into booking_reference_seq default values returning id',
+  )
+
+  const sequence = row?.id
+  if (typeof sequence !== 'number') {
+    throw new Error('The booking reference sequence did not return a row id.')
+  }
+
   return `EDU-${localYear}-${String(sequence).padStart(4, '0')}`
 }
 
@@ -516,20 +612,23 @@ function assertFacilityActive(facility: FacilityRecord): void {
 /**
  * The whole booking operation: every check and the insert, in one go.
  *
- * MUST be called from inside `inImmediateTransaction`. It is separated out so
- * that the entire check-then-insert sequence is visibly one unit - there is no
- * second transaction, and no window between validating and writing.
+ * MUST be called from inside `withTransaction`, using the connection it hands
+ * over. That is why `tx` is the first parameter and why nothing in here reaches
+ * for the pool: a statement issued outside the transaction could run on another
+ * connection entirely, and the insert would then not be covered by the checks
+ * that preceded it.
  *
  * Every rejection throws, which rolls the transaction back, so a failed attempt
  * leaves no booking behind.
  */
-function performBookingWrite(
+async function performBookingWrite(
+  tx: Queryable,
   actor: AuthenticatedUser,
   input: CreateBookingInput,
   start: Date,
   end: Date,
-): { bookingId: string; reference: string; facility: FacilityRecord } {
-  const facility = getFacilityOrThrow(input.facilityId)
+): Promise<{ bookingId: string; reference: string; facility: FacilityRecord }> {
+  const facility = await getFacilityOrThrow(input.facilityId, tx)
 
   // --- authorization BEFORE business rules, so a refusal never leaks
   //     operational detail about a facility the caller may not use ----------
@@ -540,36 +639,43 @@ function performBookingWrite(
   assertActivityPermitted(facility, input.activityPurpose)
   assertCapacity(facility, input.expectedAttendance)
   assertOpenForInterval(facility, input.date, start, end)
-  assertNotBlocked(facility.id, start, end)
-  assertNoOverlappingBooking(facility, start, end)
+  await assertNotBlocked(tx, facility.id, start, end)
+  await assertNoOverlappingBooking(tx, facility, start, end)
 
   // --- write -------------------------------------------------------------
-  const reference = nextBookingReference(input.date.slice(0, 4))
+  const reference = await nextBookingReference(tx, input.date.slice(0, 4))
   const bookingId = randomUUID()
-  const timestamp = nowIso()
 
-  getDb()
-    .prepare(
-      `insert into bookings (
-         id, booking_reference, facility_id, booked_by, activity_purpose,
-         expected_attendance, start_time, end_time, status, created_at, updated_at
-       ) values (
-         @id, @reference, @facilityId, @bookedBy, @activityPurpose,
-         @expectedAttendance, @startTime, @endTime, 'confirmed', @createdAt, @updatedAt
-       )`,
-    )
-    .run({
+  // The widened window the exclusion constraint compares. It must be exactly
+  // what the stated buffer produces, because a CHECK constraint enforces that -
+  // so this value and `buffer_minutes` are written from the same expression the
+  // constraint validates.
+  const window = bufferWindow({ start, end }, facility.bufferMinutes)
+
+  await tx.execute(
+    `insert into bookings (
+       id, booking_reference, facility_id, booked_by, activity_purpose,
+       expected_attendance, start_time, end_time, buffer_minutes,
+       effective_start, effective_end, status
+     ) values (
+       @id, @reference, @facilityId, @bookedBy, @activityPurpose,
+       @expectedAttendance, @startTime, @endTime, @bufferMinutes,
+       @effectiveStart, @effectiveEnd, 'confirmed'
+     )`,
+    {
       id: bookingId,
       reference,
       facilityId: facility.id,
       bookedBy: actor.id,
       activityPurpose: input.activityPurpose.trim(),
       expectedAttendance: input.expectedAttendance,
-      startTime: start.toISOString(),
-      endTime: end.toISOString(),
-      createdAt: timestamp,
-      updatedAt: timestamp,
-    })
+      startTime: start,
+      endTime: end,
+      bufferMinutes: facility.bufferMinutes,
+      effectiveStart: window.start,
+      effectiveEnd: window.end,
+    },
+  )
 
   return { bookingId, reference, facility }
 }
@@ -577,11 +683,14 @@ function performBookingWrite(
 /**
  * Creates a confirmed booking and returns it, fully joined.
  *
- * The write runs in exactly one IMMEDIATE transaction. The audit entry and the
- * reload happen afterwards, deliberately outside it: a logging failure must not
- * roll back a booking that genuinely succeeded, and `recordAudit` never throws.
+ * The write runs in exactly one transaction. The audit entry and the reload
+ * happen afterwards, deliberately outside it: a logging failure must not roll
+ * back a booking that genuinely succeeded, and `recordAudit` never throws.
  */
-export function createBooking(actor: AuthenticatedUser, input: CreateBookingInput): BookingRecord {
+export async function createBooking(
+  actor: AuthenticatedUser,
+  input: CreateBookingInput,
+): Promise<BookingRecord> {
   const start = combineLocalDateTimeToUtc(input.date, input.startTime)
   const end = combineLocalDateTimeToUtc(input.date, input.endTime)
 
@@ -598,19 +707,34 @@ export function createBooking(actor: AuthenticatedUser, input: CreateBookingInpu
     )
   }
 
-  const { bookingId, reference, facility } = inImmediateTransaction(() =>
-    performBookingWrite(actor, input, start, end),
-  )
+  let written: { bookingId: string; reference: string; facility: FacilityRecord }
 
-  recordAudit({
+  try {
+    written = await withTransaction((tx) => performBookingWrite(tx, actor, input, start, end))
+  } catch (error) {
+    if (!isOverlapViolation(error)) throw error
+
+    // The exclusion constraint refused the insert, which means the checks above
+    // found nothing but another request committed a colliding booking in the
+    // meantime. That is precisely the race the constraint exists for.
+    //
+    // The transaction has already rolled back, so re-querying here reads the
+    // other request's COMMITTED row and can describe the collision properly.
+    // The user gets the same 409 they would have got had the check seen it,
+    // because which of the two paths rejected them is an implementation detail.
+    const facility = await getFacilityOrThrow(input.facilityId)
+    throw conflictError(facility, await findOverlappingBooking(db, facility, start, end))
+  }
+
+  await recordAudit({
     actorId: actor.id,
     action: 'booking.created',
     entityType: 'booking',
-    entityId: bookingId,
+    entityId: written.bookingId,
     metadata: {
-      reference,
-      facilityId: facility.id,
-      facilityName: facility.name,
+      reference: written.reference,
+      facilityId: written.facility.id,
+      facilityName: written.facility.name,
       localDate: input.date,
       startTime: input.startTime,
       endTime: input.endTime,
@@ -619,7 +743,7 @@ export function createBooking(actor: AuthenticatedUser, input: CreateBookingInpu
     },
   })
 
-  return getBookingOrThrow(bookingId)
+  return getBookingOrThrow(written.bookingId)
 }
 
 // ---------------------------------------------------------------------------
@@ -640,14 +764,18 @@ export interface CancelBookingInput {
  * Timing: a booking that has already started cannot be cancelled by its owner.
  * An administrator can, because the plausible cases - a room double-let, a
  * facility failure - need an override.
+ *
+ * Releasing the slot needs no extra work: the exclusion constraint is partial on
+ * `status = 'confirmed'`, so a cancelled row leaves the index and stops blocking
+ * anything the moment this UPDATE commits.
  */
-export function cancelBooking(
+export async function cancelBooking(
   actor: AuthenticatedUser,
   bookingId: string,
   input: CancelBookingInput = {},
-): BookingRecord {
-  const result = inImmediateTransaction(() => {
-    const booking = getBookingOrThrow(bookingId)
+): Promise<BookingRecord> {
+  const cancelled = await withTransaction(async (tx) => {
+    const booking = await getBookingOrThrow(bookingId, tx)
     const isAdmin = actor.role === 'admin'
     const isOwner = booking.bookedById === actor.id
 
@@ -680,40 +808,38 @@ export function cancelBooking(
       )
     }
 
-    const timestamp = nowIso()
-
-    getDb()
-      .prepare(
-        `update bookings
-            set status = 'cancelled',
-                cancelled_at = @cancelledAt,
-                cancelled_by = @cancelledBy,
-                cancellation_reason = @reason
-          where id = @id
-            and status = 'confirmed'`,
-      )
-      .run({
+    await tx.execute(
+      `update bookings
+          set status = 'cancelled',
+              cancelled_at = @cancelledAt,
+              cancelled_by = @cancelledBy,
+              cancellation_reason = @reason
+        where id = @id
+          and status = 'confirmed'`,
+      {
         id: bookingId,
-        cancelledAt: timestamp,
+        cancelledAt: new Date(),
         cancelledBy: actor.id,
-        reason: input.reason?.trim() || (isAdmin && !isOwner ? 'Cancelled by an administrator' : null),
-      })
+        reason:
+          input.reason?.trim() || (isAdmin && !isOwner ? 'Cancelled by an administrator' : null),
+      },
+    )
 
     return booking
   })
 
-  recordAudit({
+  await recordAudit({
     actorId: actor.id,
     action: 'booking.cancelled',
     entityType: 'booking',
     entityId: bookingId,
     metadata: {
-      reference: result.reference,
-      facilityId: result.facilityId,
-      facilityName: result.facilityName,
-      wasBookedBy: result.bookedById,
+      reference: cancelled.reference,
+      facilityId: cancelled.facilityId,
+      facilityName: cancelled.facilityName,
+      wasBookedBy: cancelled.bookedById,
       reason: input.reason ?? null,
-      releasedSlot: { startTime: result.startTime, endTime: result.endTime },
+      releasedSlot: { startTime: cancelled.startTime, endTime: cancelled.endTime },
     },
   })
 
@@ -761,15 +887,15 @@ export interface EvaluateSlotParams {
  * why the booking path re-checks inside its transaction rather than trusting
  * this result.
  */
-export function evaluateBookingRequest(params: EvaluateSlotParams): SlotEvaluation {
+export async function evaluateBookingRequest(params: EvaluateSlotParams): Promise<SlotEvaluation> {
   try {
     assertMayBook(params.facility, params.actor)
     assertFacilityActive(params.facility)
     assertActivityPermitted(params.facility, params.activityPurpose)
     assertCapacity(params.facility, params.expectedAttendance)
     assertOpenForInterval(params.facility, params.localDate, params.start, params.end)
-    assertNotBlocked(params.facility.id, params.start, params.end)
-    assertNoOverlappingBooking(params.facility, params.start, params.end)
+    await assertNotBlocked(db, params.facility.id, params.start, params.end)
+    await assertNoOverlappingBooking(db, params.facility, params.start, params.end)
 
     return { bookable: true }
   } catch (error) {

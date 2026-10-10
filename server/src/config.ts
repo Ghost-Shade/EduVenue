@@ -14,7 +14,7 @@ import dotenv from 'dotenv'
 
 const here = path.dirname(fileURLToPath(import.meta.url))
 
-/** The `server/` directory. Relative DATABASE_FILE paths resolve against this. */
+/** The `server/` directory. */
 export const SERVER_ROOT = path.resolve(here, '..')
 
 /** The repository root, one level above `server/`. Holds `.env`. */
@@ -28,6 +28,18 @@ dotenv.config({ path: path.join(REPO_ROOT, '.env') })
 
 export type NodeEnv = 'development' | 'production' | 'test'
 
+/**
+ * Local Postgres from docker-compose.yml.
+ *
+ * These are DEVELOPMENT defaults, not credentials: the container is bound to
+ * this machine, and the password is published in docker-compose.yml. Production
+ * has no default at all - the URL is injected by the Vercel/Neon integration,
+ * and its absence is a configuration error rather than a silent fallback to
+ * something local.
+ */
+const LOCAL_DEV_DATABASE_URL = 'postgres://eduvenue:eduvenue_local_only@localhost:5433/eduvenue'
+const LOCAL_TEST_DATABASE_URL = 'postgres://eduvenue:eduvenue_local_only@localhost:5433/eduvenue_test'
+
 export interface AppConfig {
   nodeEnv: NodeEnv
   isProduction: boolean
@@ -36,8 +48,20 @@ export interface AppConfig {
   port: number
   sessionSecret: string
 
-  /** Absolute path to the SQLite file in use, or ':memory:' for tests. */
-  databaseFile: string
+  /** PostgreSQL connection string. Never logged directly - see redactDatabaseUrl. */
+  databaseUrl: string
+
+  /**
+   * Schema to pin `search_path` to.
+   *
+   * Set only by the test harness, which gives each test file its own schema so
+   * that files `node --test` runs in parallel cannot see each other's rows.
+   * Null everywhere else, which means the normal `public` schema.
+   */
+  databaseSchema: string | null
+
+  /** Connection pool ceiling. Kept small: serverless instances multiply it. */
+  databasePoolSize: number
 
   /** Whether the demo-account shortcuts should be offered on the sign-in page. */
   enableDemoLogins: boolean
@@ -111,23 +135,81 @@ function readSessionSecret(nodeEnv: NodeEnv): string {
   return secret
 }
 
-function readDatabaseFile(nodeEnv: NodeEnv): string {
-  // Tests get a separate database so that running the suite can never destroy
-  // the development data that the demo depends on.
-  const raw =
+function readDatabaseUrl(nodeEnv: NodeEnv): string {
+  const fallback =
     nodeEnv === 'test'
-      ? (process.env.TEST_DATABASE_FILE ?? '../data/eduvenue.test.db')
-      : (process.env.DATABASE_FILE ?? '../data/eduvenue.db')
+      ? LOCAL_TEST_DATABASE_URL
+      : nodeEnv === 'development'
+        ? LOCAL_DEV_DATABASE_URL
+        : ''
 
-  const trimmed = raw.trim()
+  const raw = (nodeEnv === 'test' ? process.env.TEST_DATABASE_URL : process.env.DATABASE_URL) ?? ''
+  const value = raw.trim() || fallback
 
-  if (trimmed === ':memory:') {
-    return ':memory:'
+  if (value === '') {
+    throw new ConfigurationError(
+      'DATABASE_URL is not set. Point it at a PostgreSQL database, for example:\n' +
+        `  DATABASE_URL=${LOCAL_DEV_DATABASE_URL}\n\n` +
+        'For local development, `docker compose up -d` starts one on port 5433.',
+    )
   }
 
-  // Relative paths are resolved against server/ rather than cwd, so the value
-  // in .env means the same thing however the process was started.
-  return path.isAbsolute(trimmed) ? trimmed : path.resolve(SERVER_ROOT, trimmed)
+  if (!/^postgres(ql)?:\/\//.test(value)) {
+    throw new ConfigurationError(
+      'DATABASE_URL must be a PostgreSQL connection string beginning with ' +
+        `"postgres://" or "postgresql://", received "${redact(value)}".`,
+    )
+  }
+
+  return value
+}
+
+/**
+ * The schema to pin `search_path` to, if any.
+ *
+ * Restricted to a conservative identifier shape because the value is
+ * interpolated into the connection's `options` string. It is generated
+ * internally rather than taken from a user, but a value that could carry a space
+ * or a semicolon would silently change the connection's behaviour, so the shape
+ * is enforced here rather than assumed.
+ */
+function readDatabaseSchema(nodeEnv: NodeEnv): string | null {
+  // Only the test harness uses this. A schema override in production would mean
+  // serving an application from a schema nobody expects it to be in.
+  if (nodeEnv !== 'test') return null
+
+  const raw = (process.env.DATABASE_SCHEMA ?? '').trim()
+  if (raw === '') return null
+
+  if (!/^[a-z_][a-z0-9_]*$/.test(raw)) {
+    throw new ConfigurationError(
+      `DATABASE_SCHEMA must match [a-z_][a-z0-9_]*, received "${redact(raw)}".`,
+    )
+  }
+
+  return raw
+}
+
+function readDatabasePoolSize(): number {
+  const raw = (process.env.DATABASE_POOL_MAX ?? '5').trim()
+  const size = Number(raw)
+
+  if (!Number.isInteger(size) || size < 1 || size > 100) {
+    throw new ConfigurationError(
+      `DATABASE_POOL_MAX must be an integer between 1 and 100, received "${raw}".`,
+    )
+  }
+
+  return size
+}
+
+/**
+ * Masks the password inside a connection string for safe inclusion in an error
+ * message. A configuration error is often the first thing a developer pastes
+ * into a chat window, and a DATABASE_URL carries a live credential.
+ */
+function redact(value: string): string {
+  return value.replace(/:\/\/([^:@/]+):[^@/]*@/, '://$1:****@')
 }
 
 function readBoolean(value: string | undefined, fallback: boolean): boolean {
@@ -146,7 +228,9 @@ function loadConfig(): AppConfig {
 
     port: readPort(),
     sessionSecret: readSessionSecret(nodeEnv),
-    databaseFile: readDatabaseFile(nodeEnv),
+    databaseUrl: readDatabaseUrl(nodeEnv),
+    databaseSchema: readDatabaseSchema(nodeEnv),
+    databasePoolSize: readDatabasePoolSize(),
 
     // Demo logins are convenient but must never be silently on in production.
     enableDemoLogins: isProduction ? false : readBoolean(process.env.ENABLE_DEMO_LOGINS, true),

@@ -14,6 +14,7 @@ import assert from 'node:assert/strict'
 import {
   intervalsOverlap,
   intervalsConflictWithBuffer,
+  bufferWindow,
   findFirstConflict,
   subtractIntervals,
   assertValidInterval,
@@ -126,6 +127,87 @@ describe('intervalsConflictWithBuffer - transition gaps', () => {
       () => intervalsConflictWithBuffer(twoPm, at(`${B}18:00:00.000Z`, `${B}19:00:00.000Z`), -5),
       InvalidIntervalError,
     )
+  })
+})
+
+describe('bufferWindow - the form the database constraint can use', () => {
+  /**
+   * Widening each booking by half the buffer and testing for PLAIN overlap has
+   * to give the same answer as widening the COMPARISON by the full buffer.
+   *
+   * This equivalence is what lets the exclusion constraint in schema.sql enforce
+   * the same rule the service applies. An exclusion constraint compares ranges
+   * and cannot call a function, so it can only use the second form - and if the
+   * two forms ever disagreed, the database would accept bookings the service
+   * rejects, or refuse bookings it accepts, with no error anywhere to explain it.
+   */
+  const cases: Array<[string, string, string, string]> = [
+    // Exact overlap.
+    [`${B}14:00:00.000Z`, `${B}16:00:00.000Z`, `${B}14:00:00.000Z`, `${B}16:00:00.000Z`],
+    // Partial overlaps, both directions.
+    [`${B}15:00:00.000Z`, `${B}17:00:00.000Z`, `${B}14:00:00.000Z`, `${B}16:00:00.000Z`],
+    [`${B}13:00:00.000Z`, `${B}15:00:00.000Z`, `${B}14:00:00.000Z`, `${B}16:00:00.000Z`],
+    // Contained and containing.
+    [`${B}14:30:00.000Z`, `${B}15:00:00.000Z`, `${B}14:00:00.000Z`, `${B}16:00:00.000Z`],
+    [`${B}13:00:00.000Z`, `${B}17:00:00.000Z`, `${B}14:00:00.000Z`, `${B}16:00:00.000Z`],
+    // Exactly touching, on both sides. These are the boundary cases where the
+    // two forms are most likely to diverge.
+    [`${B}16:00:00.000Z`, `${B}17:00:00.000Z`, `${B}14:00:00.000Z`, `${B}16:00:00.000Z`],
+    [`${B}13:00:00.000Z`, `${B}14:00:00.000Z`, `${B}14:00:00.000Z`, `${B}16:00:00.000Z`],
+    // A gap of exactly the buffer, and one minute less.
+    [`${B}16:15:00.000Z`, `${B}17:00:00.000Z`, `${B}14:00:00.000Z`, `${B}16:00:00.000Z`],
+    [`${B}16:14:00.000Z`, `${B}17:00:00.000Z`, `${B}14:00:00.000Z`, `${B}16:00:00.000Z`],
+    // Comfortably clear.
+    [`${B}18:00:00.000Z`, `${B}19:00:00.000Z`, `${B}14:00:00.000Z`, `${B}16:00:00.000Z`],
+  ]
+
+  for (const buffer of [0, 5, 15, 60, 120]) {
+    test(`agrees with intervalsConflictWithBuffer at a ${buffer}-minute buffer`, () => {
+      for (const [aStart, aEnd, bStart, bEnd] of cases) {
+        const a = at(aStart, aEnd)
+        const b = at(bStart, bEnd)
+
+        assert.equal(
+          intervalsOverlap(bufferWindow(a, buffer), bufferWindow(b, buffer)),
+          intervalsConflictWithBuffer(a, b, buffer),
+          `disagreement at buffer=${buffer} for ${aStart}-${aEnd} vs ${bStart}-${bEnd}`,
+        )
+      }
+    })
+  }
+
+  test('widens by half the buffer at each end, not the whole buffer', () => {
+    // A 15-minute buffer shifts each end by 7.5 minutes. The half is what makes
+    // the gap between two bookings come out at exactly 15 minutes rather than 30.
+    const window = bufferWindow(twoPm, 15)
+
+    assert.equal(window.start.toISOString(), `${B}13:52:30.000Z`)
+    assert.equal(window.end.toISOString(), `${B}16:07:30.000Z`)
+  })
+
+  test('a booking in a lab with a 15-minute buffer can still follow a class 15 minutes later', () => {
+    // The concrete case this arithmetic exists to get right: the seeded
+    // Computing Lab A requires 15 minutes, and two bookings 15 minutes apart
+    // must be legal. Widening by the full buffer each side would reject them.
+    const earlier = at(`${B}08:00:00.000Z`, `${B}10:00:00.000Z`)
+    const later = at(`${B}10:15:00.000Z`, `${B}12:00:00.000Z`)
+
+    assert.equal(
+      intervalsOverlap(bufferWindow(earlier, 15), bufferWindow(later, 15)),
+      false,
+      'a 15-minute gap should satisfy a 15-minute buffer',
+    )
+    assert.equal(intervalsConflictWithBuffer(earlier, later, 15), false)
+  })
+
+  test('a zero buffer leaves the interval untouched', () => {
+    const window = bufferWindow(twoPm, 0)
+    assert.equal(window.start.toISOString(), twoPm.start.toISOString())
+    assert.equal(window.end.toISOString(), twoPm.end.toISOString())
+  })
+
+  test('rejects a negative buffer as invalid input', () => {
+    assert.throws(() => bufferWindow(twoPm, -5), InvalidIntervalError)
   })
 })
 

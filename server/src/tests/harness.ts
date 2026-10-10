@@ -1,23 +1,35 @@
 /**
- * Shared test harness: a throwaway database, sign-in helpers, and a real HTTP
+ * Shared test harness: a throwaway schema, sign-in helpers, and a real HTTP
  * server for the tests that must exercise the whole request path.
  *
  * Importing this module must be preceded by nothing - it imports `env.ts` first
  * itself, so a test file only needs:
  *
  *     import { prepareTestDatabase, signInAs } from './harness.ts'
+ *
+ * Everything here is ASYNC now, because every database call is a network round
+ * trip. `prepareTestDatabase()` must be awaited before any service call, and
+ * `signInAs` too. Forgetting is a compile error rather than a silent race,
+ * because the functions no longer have synchronous return types.
  */
 import './env.ts'
 
 import { once } from 'node:events'
 import type { AddressInfo } from 'node:net'
 import type { Server } from 'node:http'
+import { after } from 'node:test'
 
-import { applySchema } from '../db/migrate.ts'
+import { createApp } from '../app.ts'
+import { getConfig } from '../config.ts'
+import { applySchema, recreateSchema } from '../db/migrate.ts'
+import { closePool, waitForDatabase } from '../db/connection.ts'
 import { seedDatabase } from '../db/seed.ts'
-import { useDatabase, type Db } from '../db/connection.ts'
-import { createApp } from '../index.ts'
-import { addDaysToLocalDate, combineLocalDateTimeToUtc, toLocalDateString, type LocalDateString } from '../lib/time.ts'
+import {
+  addDaysToLocalDate,
+  combineLocalDateTimeToUtc,
+  toLocalDateString,
+  type LocalDateString,
+} from '../lib/time.ts'
 import type { FacilityRecord } from '../services/facilityService.ts'
 import {
   createSession,
@@ -26,26 +38,56 @@ import {
   type AuthenticatedUser,
 } from '../services/sessionService.ts'
 
+/**
+ * Releases the connection pool when the file's tests finish.
+ *
+ * Registered HERE rather than left to each test file, because forgetting it is
+ * not a failing test - it is a test run that HANGS. An open pool keeps idle
+ * sockets, an idle socket keeps the event loop alive, and `node --test` waits
+ * for the child process to exit. The file would simply never finish, with no
+ * error explaining why.
+ *
+ * `node --test` gives each file its own process, and ESM evaluates this module
+ * once, so exactly one hook is registered per process.
+ */
+after(async () => {
+  await closePool()
+})
+
 let prepared = false
 
 /**
- * Opens a fresh in-memory database, applies the schema and seeds it.
+ * Creates this test file's schema, applies the schema and seeds it.
  *
- * Idempotent, so the several test files that call it at module load cost
- * nothing after the first call. `.immediate()`-style write locking is not used
- * during setup: the harness runs before any test, on a database only this
- * process can see.
+ * Idempotent, so the several places that call it at module load cost nothing
+ * after the first call.
+ *
+ * `drop ... cascade` then `create` rather than trusting an empty schema: the
+ * database PERSISTS between runs (it is a Docker volume), so the previous run's
+ * tables are still there. Recreating is what makes a second run behave like the
+ * first one, which is the whole point of a test database.
  */
-export function prepareTestDatabase(): Db {
-  const db = useDatabase(':memory:')
+export async function prepareTestDatabase(): Promise<void> {
+  if (prepared) return
 
-  if (!prepared) {
-    applySchema(db)
-    seedDatabase(db)
-    prepared = true
+  const schema = getConfig().databaseSchema
+  if (!schema) {
+    throw new Error(
+      'DATABASE_SCHEMA is not set, so tests would run against the public schema. ' +
+        'tests/env.ts should have set it - check that it is imported before anything else.',
+    )
   }
 
-  return db
+  // A container that has just been started refuses connections for a moment.
+  // This turns that into the actionable "start Docker" message rather than a
+  // raw ECONNREFUSED from whichever test happened to run first.
+  await waitForDatabase()
+
+  await recreateSchema(schema)
+  await applySchema()
+  await seedDatabase()
+
+  prepared = true
 }
 
 /** Every demo user id, so tests do not have to hard-code them at each call site. */
@@ -73,10 +115,10 @@ export interface TestSession {
  * bcrypt, which the login route would run - one test in api.test.ts covers the
  * real login route separately, so the cost is paid once.
  */
-export function signInAs(userId: string): TestSession {
-  const { token } = createSession(userId, 'test-harness')
+export async function signInAs(userId: string): Promise<TestSession> {
+  const { token } = await createSession(userId, 'test-harness')
 
-  const user = findSessionUser(token)
+  const user = await findSessionUser(token)
   if (!user) {
     throw new Error(`Could not sign in as "${userId}" - the session did not resolve to a user.`)
   }
@@ -88,6 +130,21 @@ export function signInAs(userId: string): TestSession {
 export function localWeekday(date: LocalDateString): number {
   const middayUtc = combineLocalDateTimeToUtc(date, '12:00')
   return new Date(middayUtc.getTime() + 12 * 60 * 60 * 1000).getUTCDay()
+}
+
+/**
+ * The UTC instants bounding a local calendar date.
+ *
+ * Replaces the SQLite-era `start_time like '2026-05-04%'`, which worked only
+ * because timestamps were stored as ISO text. `timestamptz` is a real instant,
+ * so "on this local date" is a half-open range - which is also the correct
+ * comparison, since it uses the index on start_time.
+ */
+export function localDateBounds(date: LocalDateString): { from: Date; to: Date } {
+  return {
+    from: combineLocalDateTimeToUtc(date, '00:00'),
+    to: combineLocalDateTimeToUtc(addDaysToLocalDate(date, 1), '00:00'),
+  }
 }
 
 /**
@@ -154,7 +211,7 @@ export interface TestServer {
  * collides with a development server already running on 4000.
  */
 export async function startTestServer(): Promise<TestServer> {
-  prepareTestDatabase()
+  await prepareTestDatabase()
 
   const app = createApp()
   const server: Server = app.listen(0)

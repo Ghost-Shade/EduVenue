@@ -18,9 +18,19 @@ out/
 .vite/
 
 # --- Local database / dumps ------------------------------------------------
+# The application uses PostgreSQL, so nothing it writes lands here: local data
+# lives in a Docker volume. These patterns remain because a stray SQLite file is
+# still something that must never be committed - the WAL/SHM companions in
+# particular, which `*.db` alone does NOT match (`*.db-shm` is a different
+# filename), and which were committed to this repository by mistake once already.
 *.sqlite
 *.sqlite3
+*.sqlite-shm
+*.sqlite-wal
 *.db
+*.db-shm
+*.db-wal
+*.db-journal
 *.dump
 dumps/
 

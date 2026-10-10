@@ -82,11 +82,13 @@ export function intervalsOverlap(a: Interval, b: Interval): boolean {
  * With buffer = 0 this reduces exactly to `intervalsOverlap`, so there is a
  * single code path and no chance of the two rules drifting apart.
  *
- * NOTE ON THE DATABASE CONSTRAINT: the exclusion constraint in schema.sql
- * enforces plain overlap only - SQL can express "no intersection" but not "no
- * intersection and at least N minutes apart". Buffers are therefore enforced
- * here, inside the booking transaction, which locks the facility row. The
- * constraint remains the backstop.
+ * HOW THIS RELATES TO THE DATABASE CONSTRAINT: the exclusion constraint in
+ * schema.sql cannot call this function, so it enforces the buffer a different
+ * way - by comparing windows widened by half the buffer at each end, which
+ * `bufferWindow` below computes and which is algebraically the same rule. The
+ * two implementations are pinned against each other by a test in
+ * tests/overlap.test.ts, because a silent disagreement between "the constraint
+ * accepted it" and "the service rejected it" would be very hard to diagnose.
  */
 export function intervalsConflictWithBuffer(
   a: Interval,
@@ -103,6 +105,53 @@ export function intervalsConflictWithBuffer(
     a.start.getTime() < b.end.getTime() + bufferMs &&
     a.end.getTime() + bufferMs > b.start.getTime()
   )
+}
+
+/**
+ * The window a booking actually occupies once the facility's preparation buffer
+ * is applied.
+ *
+ * A facility with `bufferMinutes = 15` requires a 15-minute gap between
+ * consecutive bookings. There are two equivalent ways to express that, and this
+ * function is the second:
+ *
+ *   1. Widen the COMPARISON:  a.start < b.end + b  AND  a.end + b > b.start
+ *      (that is `intervalsConflictWithBuffer` above, and what the service uses)
+ *
+ *   2. Widen each BOOKING by half the buffer, then test for plain overlap:
+ *
+ *          |---- effective ----|
+ *                 [ start   end ]
+ *                           b/2 | b/2
+ *                                [ start   end ]
+ *                               |---- effective ----|
+ *
+ * Both say the same thing. Two half-widened windows touch exactly when the gap
+ * between the real intervals is exactly `bufferMinutes`, and that is precisely
+ * the point at which the comparison-side form stops reporting a conflict.
+ *
+ * The second form exists because an exclusion constraint compares ranges and
+ * cannot call a function that widens a comparison. It is what the
+ * `bookings_no_overlap` constraint in schema.sql uses, via the `effective_start`
+ * and `effective_end` columns this computes.
+ *
+ * THE HALF IS LOAD-BEARING. Widening each side by the FULL buffer would demand a
+ * 2 x buffer gap and reject bookings that are legal - the double-application
+ * bug that bookingService.ts warns about in its own comment. The equivalence is
+ * pinned by a test, so a future edit that "simplifies" the halving fails rather
+ * than quietly changing which bookings are accepted.
+ */
+export function bufferWindow(interval: Interval, bufferMinutes: number): Interval {
+  if (bufferMinutes < 0) {
+    throw new InvalidIntervalError('Buffer minutes cannot be negative')
+  }
+
+  const halfBufferMs = bufferMinutes * 30_000
+
+  return {
+    start: new Date(interval.start.getTime() - halfBufferMs),
+    end: new Date(interval.end.getTime() + halfBufferMs),
+  }
 }
 
 /**

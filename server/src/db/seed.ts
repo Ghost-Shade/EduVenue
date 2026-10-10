@@ -29,7 +29,15 @@ import { fileURLToPath } from 'node:url'
 import bcrypt from 'bcryptjs'
 
 import { getConfig } from '../config.ts'
-import { openDatabase, toStoredIso, type Db } from './connection.ts'
+import {
+  closePool,
+  query,
+  redactDatabaseUrl,
+  waitForDatabase,
+  withTransaction,
+  type Queryable,
+} from './connection.ts'
+import { bufferWindow } from '../lib/overlap.ts'
 import { combineLocalDateTimeToUtc, toLocalDateString, type LocalDateString } from '../lib/time.ts'
 
 // ---------------------------------------------------------------------------
@@ -595,9 +603,9 @@ function localDateOffset(days: number): LocalDateString {
   return `${shifted.getUTCFullYear()}-${pad(shifted.getUTCMonth() + 1)}-${pad(shifted.getUTCDate())}`
 }
 
-/** Combines a relative day offset and a local time into a stored UTC string. */
-function instant(daysFromToday: number, localTime: string): string {
-  return toStoredIso(combineLocalDateTimeToUtc(localDateOffset(daysFromToday), localTime))
+/** Combines a relative day offset and a local time into an instant. */
+function instant(daysFromToday: number, localTime: string): Date {
+  return combineLocalDateTimeToUtc(localDateOffset(daysFromToday), localTime)
 }
 
 interface SeedBooking {
@@ -607,11 +615,11 @@ interface SeedBooking {
   bookedBy: string
   activityPurpose: string
   expectedAttendance: number
-  startTime: string
-  endTime: string
+  startTime: Date
+  endTime: Date
   status: 'confirmed' | 'cancelled' | 'completed'
-  createdAt: string
-  cancelledAt?: string
+  createdAt: Date
+  cancelledAt?: Date
   cancelledBy?: string
   cancellationReason?: string
 }
@@ -619,8 +627,8 @@ interface SeedBooking {
 interface SeedBlock {
   id: string
   facilityId: string
-  startTime: string
-  endTime: string
+  startTime: Date
+  endTime: Date
   reason: string
   createdBy: string | null
 }
@@ -808,9 +816,14 @@ function buildSeedBlocks(): SeedBlock[] {
  * Deletion order respects foreign keys: children before parents. Reversing this
  * order would fail, which is a small demonstration that the constraints in
  * schema.sql are genuinely active rather than decorative.
+ *
+ * Sent as one parameterless statement, so PostgreSQL's simple query protocol
+ * runs the whole batch in a single round trip. (The SQLite build additionally
+ * reset `sqlite_sequence` here; an identity column has no such separate counter
+ * to reset, and `db:reset` drops the tables entirely, which restarts it.)
  */
-function clearAll(db: Db): void {
-  db.exec(`
+async function clearAll(tx: Queryable): Promise<void> {
+  await tx.execute(`
     delete from bookings;
     delete from facility_blocks;
     delete from sessions;
@@ -819,7 +832,6 @@ function clearAll(db: Db): void {
     delete from facility_categories;
     delete from profiles;
     delete from booking_reference_seq;
-    delete from sqlite_sequence where name = 'booking_reference_seq';
   `)
 }
 
@@ -829,95 +841,109 @@ function clearAll(db: Db): void {
  * Wrapped in a single transaction: either the whole dataset lands, or none of
  * it does. A half-seeded database would be far more confusing to debug than an
  * empty one.
+ *
+ * NOTE ON jsonb: JSON columns are written with an explicit `JSON.stringify` and
+ * a `::jsonb` cast rather than by handing the driver a JavaScript value. `pg`
+ * serialises a plain object as JSON but a JavaScript ARRAY as a PostgreSQL array
+ * literal (`{a,b}`), which is not valid JSON input - so `closed_days: [0]` would
+ * fail to insert, and only for the array-valued columns. Passing text and
+ * casting makes the intent explicit and the failure impossible.
  */
-export function seedDatabase(db: Db): void {
+export async function seedDatabase(): Promise<void> {
   const passwordHash = bcrypt.hashSync(DEMO_PASSWORD, BCRYPT_ROUNDS)
   // A distinct hash for the second representative proves that two accounts with
   // the same password do not share a hash, which a shared-hash shortcut would
   // hide. Worth the 100ms.
   const secondHash = bcrypt.hashSync(DEMO_PASSWORD, BCRYPT_ROUNDS)
 
-  db.transaction(() => {
-    clearAll(db)
+  // A booking snapshots the buffer its facility had at the time, and the
+  // database enforces that the widened window matches. Seeding therefore has to
+  // compute the same window the booking service would.
+  const bufferByFacility = new Map(seedFacilities.map((facility) => [facility.id, facility.bufferMinutes]))
+
+  await withTransaction(async (tx) => {
+    await clearAll(tx)
 
     // --- categories -------------------------------------------------------
-    const insertCategory = db.prepare(
-      `insert into facility_categories (id, name, description, sort_order)
-       values (@id, @name, @description, @sortOrder)`,
-    )
     for (const category of seedCategories) {
-      insertCategory.run(category)
+      await tx.execute(
+        `insert into facility_categories (id, name, description, sort_order)
+         values (@id, @name, @description, @sortOrder)`,
+        { ...category },
+      )
     }
 
     // --- profiles ---------------------------------------------------------
-    const insertProfile = db.prepare(
-      `insert into profiles (id, email, display_name, password_hash, role, department)
-       values (@id, @email, @displayName, @passwordHash, @role, @department)`,
-    )
     for (const user of seedUsers) {
-      insertProfile.run({
-        ...user,
-        passwordHash: user.id === 'user-rep-cynthia' ? secondHash : passwordHash,
-      })
+      await tx.execute(
+        `insert into profiles (id, email, display_name, password_hash, role, department)
+         values (@id, @email, @displayName, @passwordHash, @role, @department)`,
+        { ...user, passwordHash: user.id === 'user-rep-cynthia' ? secondHash : passwordHash },
+      )
     }
 
     // --- facilities -------------------------------------------------------
-    const insertFacility = db.prepare(
-      `insert into facilities (
-         id, name, category_id, building, location_description, capacity, description,
-         equipment, accessibility, status, opens_at, closes_at, closed_days,
-         slot_minutes, buffer_minutes, booking_policy, min_role, allowed_activities
-       ) values (
-         @id, @name, @categoryId, @building, @locationDescription, @capacity, @description,
-         @equipment, @accessibility, @status, @opensAt, @closesAt, @closedDays,
-         @slotMinutes, @bufferMinutes, @bookingPolicy, @minRole, @allowedActivities
-       )`,
-    )
     for (const facility of seedFacilities) {
-      insertFacility.run({
-        ...facility,
-        equipment: JSON.stringify(facility.equipment),
-        accessibility: JSON.stringify(facility.accessibility),
-        closedDays: JSON.stringify(facility.closedDays),
-        allowedActivities: JSON.stringify(facility.allowedActivities),
-      })
+      await tx.execute(
+        `insert into facilities (
+           id, name, category_id, building, location_description, capacity, description,
+           equipment, accessibility, status, opens_at, closes_at, closed_days,
+           slot_minutes, buffer_minutes, booking_policy, min_role, allowed_activities
+         ) values (
+           @id, @name, @categoryId, @building, @locationDescription, @capacity, @description,
+           @equipment::jsonb, @accessibility::jsonb, @status, @opensAt, @closesAt,
+           @closedDays::jsonb, @slotMinutes, @bufferMinutes, @bookingPolicy, @minRole,
+           @allowedActivities::jsonb
+         )`,
+        {
+          ...facility,
+          equipment: JSON.stringify(facility.equipment),
+          accessibility: JSON.stringify(facility.accessibility),
+          closedDays: JSON.stringify(facility.closedDays),
+          allowedActivities: JSON.stringify(facility.allowedActivities),
+        },
+      )
     }
 
     // --- blocks -----------------------------------------------------------
-    const insertBlock = db.prepare(
-      `insert into facility_blocks (id, facility_id, start_time, end_time, reason, created_by)
-       values (@id, @facilityId, @startTime, @endTime, @reason, @createdBy)`,
-    )
     for (const block of buildSeedBlocks()) {
-      insertBlock.run(block)
+      await tx.execute(
+        `insert into facility_blocks (id, facility_id, start_time, end_time, reason, created_by)
+         values (@id, @facilityId, @startTime, @endTime, @reason, @createdBy)`,
+        { ...block },
+      )
     }
 
     // --- bookings ---------------------------------------------------------
-    const insertBooking = db.prepare(
-      `insert into bookings (
-         id, booking_reference, facility_id, booked_by, activity_purpose,
-         expected_attendance, start_time, end_time, status,
-         created_at, cancelled_at, cancelled_by, cancellation_reason
-       ) values (
-         @id, @reference, @facilityId, @bookedBy, @activityPurpose,
-         @expectedAttendance, @startTime, @endTime, @status,
-         @createdAt, @cancelledAt, @cancelledBy, @cancellationReason
-       )`,
-    )
     for (const booking of buildSeedBookings()) {
-      insertBooking.run({
-        ...booking,
-        cancelledAt: booking.cancelledAt ?? null,
-        cancelledBy: booking.cancelledBy ?? null,
-        cancellationReason: booking.cancellationReason ?? null,
-      })
+      const bufferMinutes = bufferByFacility.get(booking.facilityId) ?? 0
+      const window = bufferWindow({ start: booking.startTime, end: booking.endTime }, bufferMinutes)
+
+      await tx.execute(
+        `insert into bookings (
+           id, booking_reference, facility_id, booked_by, activity_purpose,
+           expected_attendance, start_time, end_time, buffer_minutes,
+           effective_start, effective_end, status,
+           created_at, cancelled_at, cancelled_by, cancellation_reason
+         ) values (
+           @id, @reference, @facilityId, @bookedBy, @activityPurpose,
+           @expectedAttendance, @startTime, @endTime, @bufferMinutes,
+           @effectiveStart, @effectiveEnd, @status,
+           @createdAt, @cancelledAt, @cancelledBy, @cancellationReason
+         )`,
+        {
+          ...booking,
+          bufferMinutes,
+          effectiveStart: window.start,
+          effectiveEnd: window.end,
+          cancelledAt: booking.cancelledAt ?? null,
+          cancelledBy: booking.cancelledBy ?? null,
+          cancellationReason: booking.cancellationReason ?? null,
+        },
+      )
     }
 
     // --- audit trail ------------------------------------------------------
-    const insertAudit = db.prepare(
-      `insert into audit_logs (id, actor_id, action, entity_type, entity_id, metadata, created_at)
-       values (@id, @actorId, @action, @entityType, @entityId, @metadata, @createdAt)`,
-    )
     const auditEntries = [
       {
         id: 'aud-demo-001',
@@ -945,41 +971,54 @@ export function seedDatabase(db: Db): void {
         createdAt: instant(-1, '17:45'),
       },
     ]
+
     for (const entry of auditEntries) {
-      insertAudit.run(entry)
+      await tx.execute(
+        `insert into audit_logs (id, actor_id, action, entity_type, entity_id, metadata, created_at)
+         values (@id, @actorId, @action, @entityType, @entityId, @metadata::jsonb, @createdAt)`,
+        { ...entry },
+      )
     }
-  })()
+  })
 }
 
-function main(): void {
+async function main(): Promise<void> {
   const config = getConfig()
 
-  console.log(`Seeding: ${config.databaseFile}`)
+  await waitForDatabase()
+
+  console.log(`Seeding: ${redactDatabaseUrl(config.databaseUrl)}`)
   console.log(`Demo password for all accounts: ${DEMO_PASSWORD}`)
   console.log(`         (${DEMO_EMAIL_DOMAIN} addresses are reserved and cannot receive mail)`)
 
-  const db = openDatabase(config.databaseFile)
-  try {
-    seedDatabase(db)
+  await seedDatabase()
 
-    const count = (table: string): number =>
-      (db.prepare(`select count(*) as n from ${table}`).get() as { n: number }).n
+  // `::int` rather than a bare count(*): PostgreSQL counts are bigint, and the
+  // driver returns a bigint as a STRING to avoid losing precision, which would
+  // print as "19" but compare as unequal to 19.
+  //
+  // The alias is `table_name`, not `table`: the shorter name is a reserved word,
+  // and although PostgreSQL does accept it as a column label, spelling it out
+  // costs nothing and removes a syntax question from a script whose failure mode
+  // is "the demo data did not load".
+  const counts = await query<{ table_name: string; n: number }>(`
+    select 'facility_categories' as table_name, count(*)::int as n from facility_categories
+    union all select 'facilities',  count(*)::int from facilities
+    union all select 'profiles',    count(*)::int from profiles
+    union all select 'bookings',    count(*)::int from bookings
+    union all select 'blocks',      count(*)::int from facility_blocks
+    union all select 'audit_logs',  count(*)::int from audit_logs
+  `)
 
-    console.log('')
-    console.log(`Categories: ${count('facility_categories')}`)
-    console.log(`Facilities: ${count('facilities')}`)
-    console.log(`Users:      ${count('profiles')}`)
-    console.log(`Bookings:   ${count('bookings')}`)
-    console.log(`Blocks:     ${count('facility_blocks')}`)
-    console.log(`Audit log:  ${count('audit_logs')}`)
-    console.log('')
-    console.log('Sample data seeded successfully.')
-    console.log(
-      'REMINDER: all facility names, capacities and schedules are illustrative sample data.',
-    )
-  } finally {
-    db.close()
+  console.log('')
+  for (const row of counts) {
+    console.log(`${row.table_name.padEnd(20)}${row.n}`)
   }
+  console.log('')
+  console.log('Sample data seeded successfully.')
+  console.log(
+    'REMINDER: all facility names, capacities and schedules are illustrative sample data.',
+  )
 }
 
 const invokedDirectly =
@@ -988,10 +1027,12 @@ const invokedDirectly =
 
 if (invokedDirectly) {
   try {
-    main()
+    await main()
   } catch (error) {
     console.error('\nSeeding failed.')
     console.error(error instanceof Error ? error.message : error)
     process.exitCode = 1
+  } finally {
+    await closePool()
   }
 }

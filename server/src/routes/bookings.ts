@@ -65,10 +65,10 @@ const SCOPES: BookingScope[] = ['upcoming', 'past', 'all']
  */
 bookingsRouter.post(
   '/recommendations',
-  asyncHandler((req, res) => {
+  asyncHandler(async (req, res) => {
     const input = parseOrThrow(recommendationSchema, req.body, badRequest)
 
-    const result = recommendFacilities(currentUser(req), {
+    const result = await recommendFacilities(currentUser(req), {
       date: input.date,
       startTime: input.startTime,
       endTime: input.endTime,
@@ -85,7 +85,7 @@ bookingsRouter.post(
 
 bookingsRouter.get(
   '/mine',
-  asyncHandler((req, res) => {
+  asyncHandler(async (req, res) => {
     const raw = req.query.scope
     const scope = typeof raw === 'string' ? raw : 'upcoming'
 
@@ -95,7 +95,7 @@ bookingsRouter.get(
       ])
     }
 
-    const bookings = listBookingsForUser(currentUser(req).id, scope as BookingScope)
+    const bookings = await listBookingsForUser(currentUser(req).id, scope as BookingScope)
 
     res.json({ bookings, scope, count: bookings.length })
   }),
@@ -104,12 +104,12 @@ bookingsRouter.get(
 bookingsRouter.post(
   '/',
   requireMinRole('rep'),
-  asyncHandler((req, res) => {
+  asyncHandler(async (req, res) => {
     const input = parseOrThrow(bookingCreateSchema, req.body, badRequest)
 
     // Every rule is enforced inside this call, inside one transaction. A
     // rejection leaves no partial booking behind.
-    const booking = createBooking(currentUser(req), input)
+    const booking = await createBooking(currentUser(req), input)
 
     res.status(201).json({ booking })
   }),
@@ -117,8 +117,8 @@ bookingsRouter.post(
 
 bookingsRouter.get(
   '/:id',
-  asyncHandler((req, res) => {
-    const booking = getBookingOrThrow(req.params.id)
+  asyncHandler(async (req, res) => {
+    const booking = await getBookingOrThrow(req.params.id)
     const actor = currentUser(req)
 
     // Someone else's booking is reported as NOT FOUND rather than forbidden, so
@@ -134,10 +134,10 @@ bookingsRouter.get(
 
 bookingsRouter.post(
   '/:id/cancel',
-  asyncHandler((req, res) => {
+  asyncHandler(async (req, res) => {
     const input = parseOrThrow(bookingCancelSchema, req.body ?? {}, badRequest)
 
-    const booking = cancelBooking(currentUser(req), req.params.id, input)
+    const booking = await cancelBooking(currentUser(req), req.params.id, input)
 
     res.json({ booking })
   }),

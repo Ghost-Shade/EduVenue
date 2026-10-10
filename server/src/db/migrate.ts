@@ -2,11 +2,17 @@
  * Schema migration.
  *
  * Applies `schema.sql` to the configured database. The schema is written to be
- * fully idempotent (`create table if not exists`, `drop trigger if exists`),
- * so running this repeatedly is safe and there is no migration-version table to
- * keep in sync. That is a deliberate hackathon simplification: it means a
- * half-finished migration cannot leave the database in a state that blocks
- * startup.
+ * fully idempotent (`create table if not exists`, `create or replace function`,
+ * `drop trigger if exists`), so running it repeatedly is safe and there is no
+ * migration-version table to keep in sync. That is a deliberate hackathon
+ * simplification: a half-finished migration cannot leave the database in a
+ * state that blocks startup.
+ *
+ * This schema is NEW, not migrated. There is no PostgreSQL database in the
+ * world holding data in an earlier version of this shape - the move to
+ * PostgreSQL was made from a SQLite file, which is not carried across. So the
+ * `if not exists` clauses exist for repeatability, not for upgrading a live
+ * database in place, and a change to a column's shape needs `db:reset`.
  *
  * Run with:  npm run db:migrate        (from the repository root)
  *        or  npm run db:migrate        (from server/)
@@ -15,8 +21,8 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 
+import { executeRaw, query, waitForDatabase } from './connection.ts'
 import { getConfig } from '../config.ts'
-import { openDatabase, type Db } from './connection.ts'
 
 const here = path.dirname(fileURLToPath(import.meta.url))
 
@@ -31,14 +37,32 @@ export class MigrationError extends Error {
   }
 }
 
+/** Every table this schema owns, children before parents. */
+export const APPLICATION_TABLES = [
+  'audit_logs',
+  'bookings',
+  'facility_blocks',
+  'sessions',
+  'facilities',
+  'facility_categories',
+  'booking_reference_seq',
+  'profiles',
+] as const
+
 /**
  * Reads and executes schema.sql.
  *
- * Uses `exec` rather than `prepare`, because the schema contains multiple
- * statements including trigger bodies. SQLite parses those correctly through
- * exec, which a prepared statement cannot do.
+ * Sent as ONE statement string rather than split on semicolons. The file
+ * contains `$$`-quoted PL/pgSQL function bodies whose semicolons are not
+ * statement separators, so a naive split would corrupt them - and the simple
+ * query protocol PostgreSQL uses for a parameterless query handles a
+ * multi-statement string natively.
+ *
+ * Through `executeRaw`, NOT `query`: this is DDL, and the named-parameter
+ * compiler that `query` applies would treat a `@` in a comment as a placeholder
+ * it was never given a value for. See connection.ts.
  */
-export function applySchema(db: Db, schemaPath: string = SCHEMA_PATH): void {
+export async function applySchema(schemaPath: string = SCHEMA_PATH): Promise<void> {
   if (!fs.existsSync(schemaPath)) {
     throw new MigrationError(`Schema file not found at "${schemaPath}".`)
   }
@@ -46,7 +70,7 @@ export function applySchema(db: Db, schemaPath: string = SCHEMA_PATH): void {
   const sql = fs.readFileSync(schemaPath, 'utf8')
 
   try {
-    db.exec(sql)
+    await executeRaw(sql)
   } catch (cause) {
     throw new MigrationError(
       `Failed to apply the schema from "${schemaPath}". ` +
@@ -56,54 +80,85 @@ export function applySchema(db: Db, schemaPath: string = SCHEMA_PATH): void {
   }
 }
 
-/** Names of the user tables currently present, for verification output. */
-export function listTables(db: Db): string[] {
-  const rows = db
-    .prepare(
-      `select name
-         from sqlite_master
-        where type = 'table'
-          and name not like 'sqlite_%'
-        order by name`,
-    )
-    .all() as Array<{ name: string }>
-
-  return rows.map((row) => row.name)
+/**
+ * Drops every table this schema owns.
+ *
+ * Deliberately drops TABLES rather than the whole schema. Dropping `public`
+ * would take `btree_gist` with it, and the extension is what makes the
+ * no-overlap constraint possible - so a reset that also tore down the thing the
+ * guarantee depends on would be answering the wrong question. The extension
+ * stays installed; only the data goes.
+ */
+export async function dropAllTables(): Promise<void> {
+  // `cascade` resolves the foreign-key ordering for us, so this list does not
+  // have to stay in dependency order.
+  await executeRaw(`drop table if exists ${APPLICATION_TABLES.join(', ')} cascade`)
 }
 
-/** Names of the indexes currently present, for verification output. */
-export function listIndexes(db: Db): string[] {
-  const rows = db
-    .prepare(
-      `select name
-         from sqlite_master
-        where type = 'index'
-          and name not like 'sqlite_%'
-        order by name`,
-    )
-    .all() as Array<{ name: string }>
-
-  return rows.map((row) => row.name)
-}
-
-function main(): void {
-  const config = getConfig()
-
-  console.log(`Applying schema to: ${config.databaseFile}`)
-
-  const db = openDatabase(config.databaseFile)
-  try {
-    applySchema(db)
-
-    const tables = listTables(db)
-    const indexes = listIndexes(db)
-
-    console.log(`Tables (${tables.length}): ${tables.join(', ')}`)
-    console.log(`Indexes (${indexes.length}): ${indexes.join(', ')}`)
-    console.log('Schema applied successfully.')
-  } finally {
-    db.close()
+/**
+ * Recreates a named schema from scratch.
+ *
+ * Used by the test suite: each test file gets its own schema, so files that
+ * `node --test` runs in parallel cannot observe each other's rows, and no test
+ * run can reach the development data.
+ *
+ * The name is validated even though every caller generates it internally,
+ * because it is interpolated into DDL that cannot be parameterised.
+ */
+export async function recreateSchema(schemaName: string): Promise<void> {
+  if (!/^[a-z_][a-z0-9_]*$/.test(schemaName)) {
+    throw new MigrationError(`Refusing to use "${schemaName}" as a schema name.`)
   }
+
+  await executeRaw(`drop schema if exists ${schemaName} cascade`)
+  await executeRaw(`create schema ${schemaName}`)
+}
+
+/** Names of the tables currently present, for verification output. */
+export async function listTables(): Promise<string[]> {
+  // current_schema() is the first entry on the search_path, so this reports the
+  // tables the application will actually read - the test schema when one is
+  // pinned, and `public` otherwise.
+  const rows = await query<{ table_name: string }>(
+    `select table_name
+       from information_schema.tables
+      where table_schema = current_schema()
+        and table_type = 'BASE TABLE'
+      order by table_name`,
+  )
+
+  return rows.map((row) => row.table_name)
+}
+
+/**
+ * Names of the indexes currently present, for verification output.
+ *
+ * Includes the index PostgreSQL builds for the no-overlap exclusion constraint,
+ * so the reset output shows the guarantee being installed rather than merely
+ * asserting that it was.
+ */
+export async function listIndexes(): Promise<string[]> {
+  const rows = await query<{ indexname: string }>(
+    `select indexname
+       from pg_indexes
+      where schemaname = current_schema()
+      order by indexname`,
+  )
+
+  return rows.map((row) => row.indexname)
+}
+
+async function main(): Promise<void> {
+  await waitForDatabase()
+  await applySchema()
+
+  const tables = await listTables()
+  const indexes = await listIndexes()
+
+  console.log(`Schema applied to ${getConfig().databaseSchema ?? 'public'}.`)
+  console.log(`Tables (${tables.length}): ${tables.join(', ')}`)
+  console.log(`Indexes (${indexes.length}): ${indexes.join(', ')}`)
+  console.log('Schema applied successfully.')
 }
 
 // Only run when executed directly, so that tests can import the helpers above
@@ -114,10 +169,13 @@ const invokedDirectly =
 
 if (invokedDirectly) {
   try {
-    main()
+    await main()
   } catch (error) {
     console.error('\nMigration failed.')
     console.error(error instanceof Error ? error.message : error)
     process.exitCode = 1
+  } finally {
+    const { closePool } = await import('./connection.ts')
+    await closePool()
   }
 }

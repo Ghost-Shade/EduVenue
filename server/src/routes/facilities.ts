@@ -33,7 +33,7 @@ facilitiesRouter.use(requireAuth)
 
 facilitiesRouter.get(
   '/',
-  asyncHandler((req, res) => {
+  asyncHandler(async (req, res) => {
     const query = parseOrThrow(facilityQuerySchema, req.query, badRequest)
 
     // `includeInactive` is an administrative view of withdrawn and
@@ -46,7 +46,7 @@ facilitiesRouter.get(
     const isAdmin = currentUser(req).role === 'admin'
     const includeInactive = isAdmin && query.includeInactive === true
 
-    const facilities = listFacilities({
+    const facilities = await listFacilities({
       q: query.q,
       categoryId: query.categoryId,
       building: query.building,
@@ -76,32 +76,41 @@ facilitiesRouter.get(
   }),
 )
 
-facilitiesRouter.get('/categories', (_req, res) => {
-  res.json({ categories: listCategories() })
-})
+facilitiesRouter.get(
+  '/categories',
+  asyncHandler(async (_req, res) => {
+    res.json({ categories: await listCategories() })
+  }),
+)
 
-facilitiesRouter.get('/buildings', (_req, res) => {
-  res.json({ buildings: listBuildings() })
-})
+facilitiesRouter.get(
+  '/buildings',
+  asyncHandler(async (_req, res) => {
+    res.json({ buildings: await listBuildings() })
+  }),
+)
 
-facilitiesRouter.get('/activities', (_req, res) => {
-  res.json({ activities: listActivities() })
-})
+facilitiesRouter.get(
+  '/activities',
+  asyncHandler(async (_req, res) => {
+    res.json({ activities: await listActivities() })
+  }),
+)
 
 facilitiesRouter.get(
   '/:id/availability',
-  asyncHandler((req, res) => {
+  asyncHandler(async (req, res) => {
     const query = parseOrThrow(availabilityQuerySchema, req.query, badRequest)
 
     // A facility id that does not exist produces a 404 from the service, so an
     // unknown id and an unknown path are distinguishable by the client.
-    res.json({ availability: getAvailability(req.params.id, query.date) })
+    res.json({ availability: await getAvailability(req.params.id, query.date) })
   }),
 )
 
 facilitiesRouter.get(
   '/:id',
-  asyncHandler((req, res) => {
-    res.json({ facility: getFacilityOrThrow(req.params.id) })
+  asyncHandler(async (req, res) => {
+    res.json({ facility: await getFacilityOrThrow(req.params.id) })
   }),
 )

@@ -29,19 +29,35 @@ import {
 /**
  * Resolves the session cookie, if present, and attaches the user.
  *
- * Never rejects a request - an anonymous request simply continues without
- * `req.user`. That is what lets the same server serve public routes such as the
- * facility directory.
+ * Never rejects a request for lack of a session - an anonymous request simply
+ * continues without `req.user`. That is what lets the same server serve public
+ * routes such as the facility directory.
+ *
+ * IT DOES reject on a DATABASE failure, via `next(error)`, and that is
+ * deliberate. Resolving a session is now a network call, and the tempting
+ * shortcut - catch everything and continue as anonymous - would turn a database
+ * blip into "everyone is signed out", with no error anywhere to explain it. The
+ * routes this middleware fronts cannot be served without the database anyway, so
+ * surfacing a 500 is both honest and no less available.
  */
-export function attachUser(req: Request, _res: Response, next: NextFunction): void {
+export async function attachUser(
+  req: Request,
+  _res: Response,
+  next: NextFunction,
+): Promise<void> {
   const cookies = req.cookies as Record<string, unknown> | undefined
   const token = cookies?.[SESSION_COOKIE_NAME]
 
   if (typeof token === 'string' && token.length > 0) {
-    const user = findSessionUser(token)
-    if (user) {
-      req.user = user
-      req.sessionToken = token
+    try {
+      const user = await findSessionUser(token)
+      if (user) {
+        req.user = user
+        req.sessionToken = token
+      }
+    } catch (error) {
+      next(error)
+      return
     }
   }
 

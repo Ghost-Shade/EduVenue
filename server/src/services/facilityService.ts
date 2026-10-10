@@ -13,8 +13,27 @@
  *     the room is physically unoccupied. That distinction is carried through to
  *     the interface, because the alternative is the application asserting
  *     something it cannot know.
+ *
+ * ===========================================================================
+ * TWO POSTGRES BEHAVIOUR CHANGES THAT WOULD HAVE FAILED SILENTLY
+ * ===========================================================================
+ *
+ * Neither of these throws. Both simply return the wrong answer, which is why
+ * they are called out here rather than left to be discovered:
+ *
+ *   - SQLite's `like` is case-insensitive for ASCII; Postgres's is NOT. A
+ *     straight port of the directory search would leave "laboratory" no longer
+ *     matching "Computing Laboratory" - a search box that quietly stops working
+ *     for lowercase input, which is how most people type. Every search
+ *     comparison here is therefore `ilike`.
+ *
+ *   - `json_each` is SQLite-only. The activity filter now uses jsonb
+ *     containment (`@>`), which is exact array membership. Substring matching
+ *     on the raw JSON text would have made a search for "Revision" also match
+ *     "Revision session", so the containment form is the one that preserves the
+ *     original intent.
  */
-import { getDb } from '../db/connection.ts'
+import { asInstantIso, db, type Queryable } from '../db/connection.ts'
 import { notFoundFacility } from '../lib/errors.ts'
 import { subtractIntervals, type Interval } from '../lib/overlap.ts'
 import { combineLocalDateTimeToUtc, type LocalDateString, type LocalTimeString } from '../lib/time.ts'
@@ -66,6 +85,14 @@ export interface FacilityFilters {
   direction?: 'asc' | 'desc' | undefined
 }
 
+/**
+ * A row as the driver returns it.
+ *
+ * The jsonb columns arrive as parsed JavaScript values, not strings - `pg`
+ * decodes jsonb on the way out. The `unknown` type is deliberate: the driver
+ * guarantees the value is JSON, not that it is an array of strings, so the shape
+ * check below is still doing real work.
+ */
 interface RawFacilityRow {
   id: string
   name: string
@@ -75,50 +102,40 @@ interface RawFacilityRow {
   location_description: string
   capacity: number
   description: string
-  equipment: string
-  accessibility: string
+  equipment: unknown
+  accessibility: unknown
   status: string
   opens_at: string
   closes_at: string
-  closed_days: string
+  closed_days: unknown
   slot_minutes: number
   buffer_minutes: number
   booking_policy: string
   min_role: string
-  allowed_activities: string
-  created_at: string
-  updated_at: string
+  allowed_activities: unknown
+  created_at: Date
+  updated_at: Date
 }
 
 /**
- * Parses a JSON array column into a string array.
+ * Narrows a jsonb column to a string array.
  *
- * The schema has `check (json_valid(...))` on every JSON column, so malformed
- * JSON cannot be stored. This still defends against a value that is valid JSON
- * but not an array of strings, and degrades to an empty list rather than
- * throwing - a single odd row should not take down the whole directory.
+ * jsonb is guaranteed to be valid JSON but not to be an array of strings, so a
+ * malformed row is still possible - and degrading to an empty list is better
+ * than throwing, because one odd row should not take down the whole directory.
  */
-function parseStringArray(value: string): string[] {
-  try {
-    const parsed: unknown = JSON.parse(value)
-    if (!Array.isArray(parsed)) return []
-    return parsed.filter((item): item is string => typeof item === 'string')
-  } catch {
-    return []
-  }
+function toStringArray(value: unknown): string[] {
+  if (!Array.isArray(value)) return []
+  return value.filter((item): item is string => typeof item === 'string')
 }
 
-/** Parses a JSON array of weekday numbers, discarding anything out of range. */
-function parseNumberArray(value: string): number[] {
-  try {
-    const parsed: unknown = JSON.parse(value)
-    if (!Array.isArray(parsed)) return []
-    return parsed.filter(
-      (item): item is number => typeof item === 'number' && Number.isInteger(item) && item >= 0 && item <= 6,
-    )
-  } catch {
-    return []
-  }
+/** Narrows a jsonb column to an array of weekday numbers, discarding anything out of range. */
+function toNumberArray(value: unknown): number[] {
+  if (!Array.isArray(value)) return []
+  return value.filter(
+    (item): item is number =>
+      typeof item === 'number' && Number.isInteger(item) && item >= 0 && item <= 6,
+  )
 }
 
 function mapFacility(row: RawFacilityRow): FacilityRecord {
@@ -131,19 +148,19 @@ function mapFacility(row: RawFacilityRow): FacilityRecord {
     locationDescription: row.location_description,
     capacity: row.capacity,
     description: row.description,
-    equipment: parseStringArray(row.equipment),
-    accessibility: parseStringArray(row.accessibility),
+    equipment: toStringArray(row.equipment),
+    accessibility: toStringArray(row.accessibility),
     status: row.status as FacilityStatus,
     opensAt: row.opens_at,
     closesAt: row.closes_at,
-    closedDays: parseNumberArray(row.closed_days),
+    closedDays: toNumberArray(row.closed_days),
     slotMinutes: row.slot_minutes,
     bufferMinutes: row.buffer_minutes,
     bookingPolicy: row.booking_policy as BookingPolicy,
     minRole: row.min_role,
-    allowedActivities: parseStringArray(row.allowed_activities),
-    createdAt: row.created_at,
-    updatedAt: row.updated_at,
+    allowedActivities: toStringArray(row.allowed_activities),
+    createdAt: asInstantIso(row.created_at),
+    updatedAt: asInstantIso(row.updated_at),
   }
 }
 
@@ -164,7 +181,10 @@ const SELECT_FACILITY = `
  * when its filter is present, and every value is bound as a parameter. No user
  * input is ever concatenated into the SQL string.
  */
-export function listFacilities(filters: FacilityFilters = {}): FacilityRecord[] {
+export async function listFacilities(
+  filters: FacilityFilters = {},
+  q: Queryable = db,
+): Promise<FacilityRecord[]> {
   const conditions: string[] = []
   const params: Record<string, unknown> = {}
 
@@ -177,12 +197,14 @@ export function listFacilities(filters: FacilityFilters = {}): FacilityRecord[] 
   }
 
   if (filters.q) {
-    // Escape the LIKE wildcards so a search for "50%" is a literal search
-    // rather than a pattern that matches everything.
+    // Escape the ILIKE wildcards so a search for "50%" is a literal search
+    // rather than a pattern that matches everything. The escape character must
+    // be named explicitly: Postgres, unlike SQLite, does not default to
+    // backslash outside of standard_conforming_strings ambiguity.
     const escaped = filters.q.replace(/[\\%_]/g, '\\$&')
     conditions.push(
-      `(f.name like @q escape '\\' or f.building like @q escape '\\' ` +
-        `or f.description like @q escape '\\' or c.name like @q escape '\\')`,
+      `(f.name ilike @q escape '\\' or f.building ilike @q escape '\\' ` +
+        `or f.description ilike @q escape '\\' or c.name ilike @q escape '\\')`,
     )
     params['q'] = `%${escaped}%`
   }
@@ -203,12 +225,11 @@ export function listFacilities(filters: FacilityFilters = {}): FacilityRecord[] 
   }
 
   if (filters.activity) {
-    // JSON array membership. json_each expands the array so the comparison is
-    // exact rather than a substring match on the raw JSON text - otherwise
-    // searching for "Revision" would also match "Revision session".
-    conditions.push(
-      `exists (select 1 from json_each(f.allowed_activities) a where a.value = @activity)`,
-    )
+    // jsonb containment is exact array membership, which is what json_each
+    // gave us in SQLite: "Revision" matches the activity "Revision" and not the
+    // activity "Revision session". `@>` survives the named-parameter compiler
+    // because its `@` is followed by `>`, which cannot start an identifier.
+    conditions.push('f.allowed_activities @> to_jsonb(@activity::text)')
     params['activity'] = filters.activity
   }
 
@@ -225,20 +246,29 @@ export function listFacilities(filters: FacilityFilters = {}): FacilityRecord[] 
 
   const where = conditions.length > 0 ? `where ${conditions.join(' and ')}` : ''
 
-  const rows = getDb()
-    .prepare(
-      `${SELECT_FACILITY} ${where} order by ${sortColumn} ${direction}, f.name asc`,
-    )
-    .all(params) as RawFacilityRow[]
+  const rows = await q.query<RawFacilityRow>(
+    `${SELECT_FACILITY} ${where} order by ${sortColumn} ${direction}, f.name asc`,
+    params,
+  )
 
   return rows.map(mapFacility)
 }
 
-/** Loads one facility, or throws a 404. */
-export function getFacilityOrThrow(facilityId: string): FacilityRecord {
-  const row = getDb()
-    .prepare(`${SELECT_FACILITY} where f.id = ?`)
-    .get(facilityId) as RawFacilityRow | undefined
+/**
+ * Loads one facility, or throws a 404.
+ *
+ * Takes an optional query interface so the booking transaction can read the
+ * facility on its own connection. It matters there: the facility's buffer and
+ * policy are read in the same transaction that writes the booking, so the values
+ * enforced and the values stored cannot come from different snapshots.
+ */
+export async function getFacilityOrThrow(
+  facilityId: string,
+  q: Queryable = db,
+): Promise<FacilityRecord> {
+  const row = await q.queryOne<RawFacilityRow>(`${SELECT_FACILITY} where f.id = @facilityId`, {
+    facilityId,
+  })
 
   if (!row) {
     throw notFoundFacility()
@@ -248,31 +278,34 @@ export function getFacilityOrThrow(facilityId: string): FacilityRecord {
 }
 
 /** Loads one facility, or null. Used where a missing record is not an error. */
-export function findFacility(facilityId: string): FacilityRecord | null {
-  const row = getDb()
-    .prepare(`${SELECT_FACILITY} where f.id = ?`)
-    .get(facilityId) as RawFacilityRow | undefined
+export async function findFacility(
+  facilityId: string,
+  q: Queryable = db,
+): Promise<FacilityRecord | null> {
+  const row = await q.queryOne<RawFacilityRow>(`${SELECT_FACILITY} where f.id = @facilityId`, {
+    facilityId,
+  })
 
   return row ? mapFacility(row) : null
 }
 
 /** All categories, with a count of active facilities in each. */
-export function listCategories(): CategoryRecord[] {
-  const rows = getDb()
-    .prepare(
-      `select c.id, c.name, c.description, c.sort_order,
-              (select count(*) from facilities f
-                where f.category_id = c.id and f.status = 'active') as facility_count
-         from facility_categories c
-        order by c.sort_order asc, c.name asc`,
-    )
-    .all() as Array<{
+export async function listCategories(q: Queryable = db): Promise<CategoryRecord[]> {
+  const rows = await q.query<{
     id: string
     name: string
     description: string
     sort_order: number
     facility_count: number
-  }>
+  }>(
+    // `count(*)` is bigint, which `pg` returns as a STRING rather than a number.
+    // Casting in SQL keeps the JSON response a number, as it was under SQLite.
+    `select c.id, c.name, c.description, c.sort_order,
+            (select count(*)::int from facilities f
+              where f.category_id = c.id and f.status = 'active') as facility_count
+       from facility_categories c
+      order by c.sort_order asc, c.name asc`,
+  )
 
   return rows.map((row) => ({
     id: row.id,
@@ -284,28 +317,28 @@ export function listCategories(): CategoryRecord[] {
 }
 
 /** Distinct buildings, for the directory's building filter. */
-export function listBuildings(): string[] {
-  const rows = getDb()
-    .prepare(
-      `select distinct building from facilities
-        where status = 'active'
-        order by building asc`,
-    )
-    .all() as Array<{ building: string }>
+export async function listBuildings(q: Queryable = db): Promise<string[]> {
+  const rows = await q.query<{ building: string }>(
+    `select distinct building from facilities
+      where status = 'active'
+      order by building asc`,
+  )
 
   return rows.map((row) => row.building)
 }
 
 /** Distinct activity purposes across all active facilities. */
-export function listActivities(): string[] {
-  const rows = getDb()
-    .prepare(
-      `select distinct a.value as activity
-         from facilities f, json_each(f.allowed_activities) a
-        where f.status = 'active'
-        order by a.value asc`,
-    )
-    .all() as Array<{ activity: string }>
+export async function listActivities(q: Queryable = db): Promise<string[]> {
+  const rows = await q.query<{ activity: string }>(
+    // jsonb_array_elements_text is the Postgres equivalent of json_each for
+    // reading a JSON array as one row per element. `distinct` then collapses
+    // the same activity offered by several facilities into a single filter
+    // option, which is what the dropdown needs.
+    `select distinct a.activity
+       from facilities f, jsonb_array_elements_text(f.allowed_activities) as a(activity)
+      where f.status = 'active'
+      order by a.activity asc`,
+  )
 
   return rows.map((row) => row.activity)
 }
@@ -354,15 +387,17 @@ const DAY_NAMES = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Frid
  * calendar day - a room that opens at 08:00 is not "free" at 06:00, it is
  * simply not operating.
  */
-export function getAvailability(facilityId: string, date: LocalDateString): AvailabilityResult {
-  const facility = getFacilityOrThrow(facilityId)
+export async function getAvailability(
+  facilityId: string,
+  date: LocalDateString,
+  q: Queryable = db,
+): Promise<AvailabilityResult> {
+  const facility = await getFacilityOrThrow(facilityId, q)
 
   // Weekday is derived from the local date, not from a UTC instant, so a
   // Sunday closure is evaluated in the campus timezone.
   const middayUtc = combineLocalDateTimeToUtc(date, '12:00')
-  const weekday = new Date(
-    middayUtc.getTime() + 12 * 60 * 60 * 1000,
-  ).getUTCDay()
+  const weekday = new Date(middayUtc.getTime() + 12 * 60 * 60 * 1000).getUTCDay()
 
   const nowMs = Date.now()
   const isPast = combineLocalDateTimeToUtc(date, '23:59').getTime() < nowMs
@@ -398,47 +433,42 @@ export function getAvailability(facilityId: string, date: LocalDateString): Avai
   const windowEnd = combineLocalDateTimeToUtc(date, facility.closesAt)
   const window: Interval = { start: windowStart, end: windowEnd }
 
-  const busyRows = getDb()
-    .prepare(
-      `select b.id, 'booking' as kind, b.activity_purpose, b.expected_attendance,
-              b.start_time, b.end_time
-         from bookings b
-        where b.facility_id = @facilityId
-          and b.status = 'confirmed'
-          and b.start_time < @windowEnd
-          and b.end_time > @windowStart
-
-        union all
-
-       select k.id, 'block' as kind, k.reason as activity_purpose, null as expected_attendance,
-              k.start_time, k.end_time
-         from facility_blocks k
-        where k.facility_id = @facilityId
-          and k.start_time < @windowEnd
-          and k.end_time > @windowStart
-
-        order by start_time asc`,
-    )
-    .all({
-      facilityId,
-      windowStart: windowStart.toISOString(),
-      windowEnd: windowEnd.toISOString(),
-    }) as Array<{
+  const busyRows = await q.query<{
     id: string
     kind: string
     activity_purpose: string
     expected_attendance: number | null
-    start_time: string
-    end_time: string
-  }>
+    start_time: Date
+    end_time: Date
+  }>(
+    `select b.id, 'booking' as kind, b.activity_purpose, b.expected_attendance,
+            b.start_time, b.end_time
+       from bookings b
+      where b.facility_id = @facilityId
+        and b.status = 'confirmed'
+        and b.start_time < @windowEnd
+        and b.end_time > @windowStart
+
+      union all
+
+     select k.id, 'block' as kind, k.reason as activity_purpose, null as expected_attendance,
+            k.start_time, k.end_time
+       from facility_blocks k
+      where k.facility_id = @facilityId
+        and k.start_time < @windowEnd
+        and k.end_time > @windowStart
+
+      order by start_time asc`,
+    { facilityId, windowStart, windowEnd },
+  )
 
   const busy: BusyPeriod[] = busyRows.map((row) => ({
     id: row.id,
     kind: row.kind === 'block' ? 'block' : 'booking',
     activityPurpose: row.activity_purpose,
     expectedAttendance: row.expected_attendance,
-    startTime: row.start_time,
-    endTime: row.end_time,
+    startTime: asInstantIso(row.start_time),
+    endTime: asInstantIso(row.end_time),
   }))
 
   const free = subtractIntervals(

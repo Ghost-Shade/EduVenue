@@ -221,8 +221,26 @@ function scoreFacility(
  *
  * Every suggestion returned has passed the full booking rule set for that exact
  * facility, date and time, so it is one the user can actually act on.
+ *
+ * ===========================================================================
+ * KNOWN COST: THIS IS SEQUENTIAL, AND ON POSTGRES THAT IS NOT FREE
+ * ===========================================================================
+ *
+ * Each `evaluateBookingRequest` below runs several queries, and the loops are
+ * awaited one at a time. Against an in-process SQLite file that was free; now
+ * each one is a network round trip, so the worst case here is on the order of
+ * a hundred of them.
+ *
+ * It is written this way ON PURPOSE, and deliberately not optimised yet. The
+ * cheap checks inside `evaluateBookingRequest` reject most (facility, day)
+ * pairs before any query runs, `maxResults` usually ends the search early, and
+ * the alternative - batching the busy-data fetch and evaluating the rules in
+ * memory - would mean a SECOND implementation of the rules. Keeping one
+ * implementation is worth more than the latency, and the fix, if it proves
+ * necessary, is to batch the data fetch and still call the shared rule
+ * functions. MEASURE BEFORE CHANGING THIS; it has not been measured.
  */
-function findAlternatives(
+async function findAlternatives(
   actor: AuthenticatedUser,
   input: RecommendationInput,
   candidates: FacilityRecord[],
@@ -231,7 +249,7 @@ function findAlternatives(
   maxResults = 6,
   maxFacilities = 8,
   maxDays = 7,
-): AlternativeSuggestion[] {
+): Promise<AlternativeSuggestion[]> {
   const suggestions: AlternativeSuggestion[] = []
 
   for (const facility of candidates.slice(0, maxFacilities)) {
@@ -253,7 +271,7 @@ function findAlternatives(
       // Never suggest a time that has already passed today.
       if (start.getTime() <= Date.now()) continue
 
-      const evaluation = evaluateBookingRequest({
+      const evaluation = await evaluateBookingRequest({
         facility,
         actor,
         start,
@@ -292,10 +310,10 @@ function findAlternatives(
  * "no results" is not an acceptable outcome for a user who is trying to find a
  * room.
  */
-export function recommendFacilities(
+export async function recommendFacilities(
   actor: AuthenticatedUser,
   input: RecommendationInput,
-): RecommendationResult {
+): Promise<RecommendationResult> {
   const requested = {
     date: input.date,
     startTime: input.startTime,
@@ -335,7 +353,7 @@ export function recommendFacilities(
     }
   }
 
-  const allFacilities = listFacilities()
+  const allFacilities = await listFacilities()
   const candidates = allFacilities.filter((facility) =>
     passesCheapChecks(facility, actor, input),
   )
@@ -344,7 +362,7 @@ export function recommendFacilities(
   const rejected: Rejection[] = []
 
   for (const facility of candidates) {
-    const evaluation = evaluateBookingRequest({
+    const evaluation = await evaluateBookingRequest({
       facility,
       actor,
       start,
@@ -376,7 +394,7 @@ export function recommendFacilities(
   // primary answer stays focused.
   const alternatives =
     recommendations.length === 0
-      ? findAlternatives(actor, input, candidates, duration, toLocalDateString(new Date()))
+      ? await findAlternatives(actor, input, candidates, duration, toLocalDateString(new Date()))
       : []
 
   return {

@@ -13,12 +13,13 @@
 import { Router } from 'express'
 
 import { getConfig } from '../config.ts'
+import { DEMO_PASSWORD } from '../db/seed.ts'
 import { badRequest, unauthenticated } from '../lib/errors.ts'
-import { ROLE_LABELS, type UserRole } from '../lib/roles.ts'
+import { ROLE_LABELS } from '../lib/roles.ts'
 import { loginSchema, parseOrThrow } from '../lib/validation.ts'
 import { currentUser, requireAuth } from '../middleware/auth.ts'
 import { asyncHandler } from '../middleware/errorHandler.ts'
-import { authenticate } from '../services/authService.ts'
+import { authenticate, listDemoAccounts } from '../services/authService.ts'
 import { recordAudit } from '../services/auditService.ts'
 import {
   createSession,
@@ -40,7 +41,7 @@ authRouter.post(
     if (!user) {
       // Deliberately identical for an unknown address and a wrong password.
       // The audit entry records the attempt without recording the password.
-      recordAudit({
+      await recordAudit({
         actorId: null,
         action: 'auth.login_failed',
         entityType: 'profile',
@@ -53,13 +54,13 @@ authRouter.post(
 
     // Opportunistic housekeeping, so expired rows do not accumulate without a
     // background scheduler to supervise.
-    purgeExpiredSessions()
+    await purgeExpiredSessions()
 
-    const { token } = createSession(user.id, req.get('user-agent') ?? null)
+    const { token } = await createSession(user.id, req.get('user-agent') ?? null)
 
     res.cookie(SESSION_COOKIE_NAME, token, sessionCookieOptions(getConfig().isProduction))
 
-    recordAudit({
+    await recordAudit({
       actorId: user.id,
       action: 'auth.login',
       entityType: 'profile',
@@ -87,10 +88,10 @@ authRouter.post(
     // is not an error.
     if (req.sessionToken) {
       const user = req.user
-      revokeSession(req.sessionToken)
+      await revokeSession(req.sessionToken)
 
       if (user) {
-        recordAudit({
+        await recordAudit({
           actorId: user.id,
           action: 'auth.logout',
           entityType: 'profile',
@@ -134,28 +135,26 @@ authRouter.get('/me', (req, res) => {
  * publishing it there would be security theatre. The guard that matters is that
  * these accounts hold nothing but sample data.
  *
- * Accounts are discovered from the database by their reserved `.test` domain
- * rather than imported from the seed module, so this route reflects whatever is
- * actually in the database.
+ * This route queries the database rather than reading a list cached on
+ * `app.locals` at startup. On a serverless platform the application is built
+ * once per cold start and must not touch the database to do it, so the query
+ * moved here; the listing is cheap and nothing polls it.
  */
-authRouter.get('/demo-accounts', (_req, res) => {
-  const config = getConfig()
+authRouter.get(
+  '/demo-accounts',
+  asyncHandler(async (_req, res) => {
+    const config = getConfig()
 
-  if (!config.enableDemoLogins) {
-    res.json({ accounts: [], password: null, enabled: false })
-    return
-  }
+    if (!config.enableDemoLogins) {
+      res.json({ accounts: [], password: null, enabled: false })
+      return
+    }
 
-  const rows = res.app.locals.demoAccounts as
-    | Array<{ email: string; displayName: string; role: UserRole; department: string | null }>
-    | undefined
+    const accounts = await listDemoAccounts()
 
-  res.json({
-    accounts: rows ?? [],
-    password: res.app.locals.demoPassword ?? null,
-    enabled: true,
-  })
-})
+    res.json({ accounts, password: DEMO_PASSWORD, enabled: true })
+  }),
+)
 
 /** Confirms authentication works, for tests and smoke checks. */
 authRouter.get('/protected-check', requireAuth, (req, res) => {

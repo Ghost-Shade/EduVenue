@@ -21,7 +21,7 @@
 import { randomBytes } from 'node:crypto'
 import bcrypt from 'bcryptjs'
 
-import { getDb } from '../db/connection.ts'
+import { db, type Queryable } from '../db/connection.ts'
 import { isUserRole, type UserRole } from '../lib/roles.ts'
 
 export interface UserRecord {
@@ -65,27 +65,32 @@ function mapUserRow(row: RawUserRow): UserRecord | null {
 const SELECT_USER = `
   select id, email, display_name, password_hash, role, department
     from profiles
-   where email = ?
+   where email = @email
 `
 
 /** Finds an account by email, or null. */
-export function findUserByEmail(email: string): UserRecord | null {
-  const row = getDb()
-    .prepare(SELECT_USER)
-    .get(email.trim().toLowerCase()) as RawUserRow | undefined
+export async function findUserByEmail(
+  email: string,
+  q: Queryable = db,
+): Promise<UserRecord | null> {
+  const row = await q.queryOne<RawUserRow>(SELECT_USER, {
+    email: email.trim().toLowerCase(),
+  })
 
   return row ? mapUserRow(row) : null
 }
 
 /** Finds an account by id, or null. */
-export function findUserById(id: string): UserRecord | null {
-  const row = getDb()
-    .prepare(
-      `select id, email, display_name, password_hash, role, department
-         from profiles
-        where id = ?`,
-    )
-    .get(id) as RawUserRow | undefined
+export async function findUserById(
+  id: string,
+  q: Queryable = db,
+): Promise<UserRecord | null> {
+  const row = await q.queryOne<RawUserRow>(
+    `select id, email, display_name, password_hash, role, department
+       from profiles
+      where id = @id`,
+    { id },
+  )
 
   return row ? mapUserRow(row) : null
 }
@@ -109,7 +114,7 @@ function getDummyHash(): string {
  * turns null into one indistinguishable error.
  */
 export async function authenticate(email: string, password: string): Promise<UserRecord | null> {
-  const user = findUserByEmail(email)
+  const user = await findUserByEmail(email)
 
   if (!user) {
     // Spend the time a real comparison would have taken, then fail.
@@ -124,4 +129,64 @@ export async function authenticate(email: string, password: string): Promise<Use
 /** Hashes a password for storage. Used by the seed script and administrator account creation. */
 export async function hashPassword(password: string): Promise<string> {
   return bcrypt.hash(password, 10)
+}
+
+export interface DemoAccount {
+  email: string
+  displayName: string
+  role: UserRole
+  department: string | null
+}
+
+/**
+ * The demo accounts, for the sign-in page's shortcut buttons.
+ *
+ * Discovered from the database by the reserved `.test` domain rather than read
+ * from the seed module, so the list reflects what is actually present - a
+ * database seeded before an account was added simply lists fewer of them.
+ *
+ * This lives here rather than inside the route because it is a query, and it
+ * used to run at STARTUP, in `createApp`. That does not work on a serverless
+ * platform, where building the application must not require a database
+ * connection: the module would be evaluated on every cold start, and a database
+ * that is briefly unavailable would fail the deployment rather than one request.
+ * Running it per request costs one query on a route nobody calls in a hot loop.
+ */
+export async function listDemoAccounts(q: Queryable = db): Promise<DemoAccount[]> {
+  // The quoted literal contains something that looks like a named parameter.
+  // compileNamedQuery copies single-quoted spans verbatim, which is what keeps
+  // this statement working - see db/connection.ts.
+  const rows = await q.query<{
+    email: string
+    display_name: string
+    role: string
+    department: string | null
+  }>(
+    `select email, display_name, role, department
+       from profiles
+      where email like '%@eduvenue.test'
+      order by case role
+                 when 'admin' then 1
+                 when 'supervisor' then 2
+                 when 'rep' then 3
+                 else 4
+               end,
+               email`,
+  )
+
+  const accounts: DemoAccount[] = []
+
+  for (const row of rows) {
+    // Same rule as mapUserRow: an unrecognised role is never coerced into a
+    // default, so it is omitted from the list rather than mislabelled.
+    if (!isUserRole(row.role)) continue
+    accounts.push({
+      email: row.email,
+      displayName: row.display_name,
+      role: row.role,
+      department: row.department,
+    })
+  }
+
+  return accounts
 }

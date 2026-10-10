@@ -1,0 +1,53 @@
+# ---------------------------------------------------------------------------
+# Local PostgreSQL for EduVenue
+# ---------------------------------------------------------------------------
+#
+# The application is PostgreSQL-only. Development, the automated test suite and
+# the deployed instance all run the same engine, so a query that works here
+# works there - and, more importantly, the no-overlap guarantee is provided by
+# the same database constraint everywhere.
+#
+#   docker compose up -d      start it (first run pulls the image)
+#   npm run db:reset          create the schema and seed the demo data
+#   docker compose down       stop it, keeping the data
+#   docker compose down -v    stop it and DELETE the data
+#
+# The credentials below are local-only and deliberately obvious. They are not
+# secrets: this container is bound to this machine and holds nothing but
+# invented demonstration data. A deployed instance gets its credentials from the
+# Vercel/Neon integration instead - see .env.example.
+#
+# Port 5433 rather than 5432, so this never collides with a PostgreSQL server
+# you already have running on the default port.
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: eduvenue-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: eduvenue
+      POSTGRES_PASSWORD: eduvenue_local_only
+      POSTGRES_DB: eduvenue
+      # C collation and UTF-8 encoding, fixed rather than inherited from the
+      # host locale. `order by name` in the directory then sorts identically on
+      # every machine, which the old SQLite build got for free from BINARY
+      # collation and Postgres would otherwise make locale-dependent.
+      POSTGRES_INITDB_ARGS: "--locale=C --encoding=UTF8"
+    ports:
+      - "5433:5432"
+    volumes:
+      - eduvenue-pgdata:/var/lib/postgresql/data
+      # Creates the separate `eduvenue_test` database on the FIRST start only.
+      # If you ever need it re-run, remove the volume with `docker compose down -v`.
+      - ./docker/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      # `npm run db:reset` retries on connection failure, but a healthcheck makes
+      # `docker compose up --wait` and the reset script's own wait loop reliable
+      # rather than a race against the image's startup.
+      test: ["CMD-SHELL", "pg_isready -U eduvenue -d eduvenue"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+volumes:
+  eduvenue-pgdata:

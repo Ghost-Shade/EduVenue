@@ -1,16 +1,20 @@
 /**
- * Shared test harness: a throwaway schema, sign-in helpers, and a real HTTP
+ * Shared test harness: a throwaway schema, identity helpers, and a real HTTP
  * server for the tests that must exercise the whole request path.
  *
  * Importing this module must be preceded by nothing - it imports `env.ts` first
  * itself, so a test file only needs:
  *
- *     import { prepareTestDatabase, signInAs } from './harness.ts'
+ *     import { prepareTestDatabase, actAs } from './harness.ts'
  *
  * Everything here is ASYNC now, because every database call is a network round
  * trip. `prepareTestDatabase()` must be awaited before any service call, and
- * `signInAs` too. Forgetting is a compile error rather than a silent race,
+ * `actAs` too. Forgetting is a compile error rather than a silent race,
  * because the functions no longer have synchronous return types.
+ *
+ * `actAs` replaced `signInAs` when authentication was removed. It is honest
+ * about what it does: it does not sign anybody in, it sets the cookie that says
+ * which profile the following requests act as. See services/identityService.ts.
  */
 import './env.ts'
 
@@ -32,11 +36,10 @@ import {
 } from '../lib/time.ts'
 import type { FacilityRecord } from '../services/facilityService.ts'
 import {
-  createSession,
-  findSessionUser,
-  SESSION_COOKIE_NAME,
+  findIdentity,
+  IDENTITY_COOKIE_NAME,
   type AuthenticatedUser,
-} from '../services/sessionService.ts'
+} from '../services/identityService.ts'
 
 /**
  * Releases the connection pool when the file's tests finish.
@@ -99,31 +102,37 @@ export const TEST_USER_IDS = {
   student: 'user-student',
 } as const
 
-export interface TestSession {
+export interface TestActor {
   user: AuthenticatedUser
-  token: string
   /** Ready-made `Cookie` header value. */
   cookie: string
 }
 
 /**
- * Creates a real session for a user and returns the resolved user.
+ * Makes the following requests act as a given user.
  *
- * Deliberately goes through sessionService rather than constructing an
- * `AuthenticatedUser` by hand: it means a change to the session shape breaks
- * these tests instead of letting them pass against a fiction. It also skips
- * bcrypt, which the login route would run - one test in api.test.ts covers the
- * real login route separately, so the cost is paid once.
+ * This is NOT a sign-in and there is nothing to verify: the cookie carries the
+ * profile id and the server believes it. That is the whole mechanism now (see
+ * services/identityService.ts), and the tests are subject to the same rule as
+ * the application - the role comes from the profile, so acting as a student
+ * really does mean being refused a booking.
+ *
+ * The id still goes through `findIdentity` rather than being turned into a
+ * cookie directly, so a test naming a profile that does not exist fails HERE,
+ * with a message about the id, instead of much later at an unrelated assertion
+ * about a 403 that was really a fallback to the default identity.
  */
-export async function signInAs(userId: string): Promise<TestSession> {
-  const { token } = await createSession(userId, 'test-harness')
+export async function actAs(userId: string): Promise<TestActor> {
+  const user = await findIdentity(userId)
 
-  const user = await findSessionUser(token)
   if (!user) {
-    throw new Error(`Could not sign in as "${userId}" - the session did not resolve to a user.`)
+    throw new Error(
+      `Could not act as "${userId}" - no profile has that id. ` +
+        'Check the id against TEST_USER_IDS and the seed data.',
+    )
   }
 
-  return { user, token, cookie: `${SESSION_COOKIE_NAME}=${token}` }
+  return { user, cookie: `${IDENTITY_COOKIE_NAME}=${userId}` }
 }
 
 /** Local weekday (0 = Sunday) of a local date, evaluated in campus terms. */
@@ -265,16 +274,16 @@ export async function apiRequest(
   return { status: response.status, body, headers: response.headers }
 }
 
-/** Extracts the session cookie from a login response, ready for reuse. */
-export function sessionCookieFrom(response: HttpResponse): string {
+/** Extracts the identity cookie from a response, ready for reuse. */
+export function identityCookieFrom(response: HttpResponse): string {
   const setCookie =
     typeof response.headers.getSetCookie === 'function'
       ? response.headers.getSetCookie()
       : (response.headers.get('set-cookie') ?? '').split(/,(?=[^;]+=)/)
 
-  const match = setCookie.find((value) => value.startsWith(`${SESSION_COOKIE_NAME}=`))
+  const match = setCookie.find((value) => value.startsWith(`${IDENTITY_COOKIE_NAME}=`))
   if (!match) {
-    throw new Error('The login response did not set a session cookie.')
+    throw new Error('The response did not set an identity cookie.')
   }
 
   const [pair] = match.split(';')

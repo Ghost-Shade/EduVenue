@@ -26,7 +26,6 @@
  */
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
-import bcrypt from 'bcryptjs'
 
 import { getConfig } from '../config.ts'
 import {
@@ -41,15 +40,18 @@ import { bufferWindow } from '../lib/overlap.ts'
 import { combineLocalDateTimeToUtc, toLocalDateString, type LocalDateString } from '../lib/time.ts'
 
 // ---------------------------------------------------------------------------
-// Shared demo credential
+// Demo identities, and NO credential of any kind
 //
-// All demo accounts share one password, printed on the sign-in page and in the
-// README. That is acceptable ONLY because these are throwaway accounts holding
-// sample data in a local database. It is called out explicitly so that nobody
-// mistakes it for a pattern to copy.
+// There used to be a shared password here, hashed with bcrypt at ten rounds.
+// There is not any more, and the removal is the point rather than a tidy-up: see
+// services/identityService.ts. The accounts below are names to act as, not
+// accounts to sign into.
+//
+// That makes the demo accounts strictly WEAKER to rely on than before, and it
+// should be read that way. Anyone who can reach the application can act as the
+// administrator. That is acceptable only because every record in this database
+// is invented sample data.
 // ---------------------------------------------------------------------------
-export const DEMO_PASSWORD = 'Demo#Pass2026'
-const BCRYPT_ROUNDS = 10
 
 /** RFC 2606 reserves `.test`, so these addresses can never reach a real inbox. */
 const DEMO_EMAIL_DOMAIN = 'eduvenue.test'
@@ -826,7 +828,6 @@ async function clearAll(tx: Queryable): Promise<void> {
   await tx.execute(`
     delete from bookings;
     delete from facility_blocks;
-    delete from sessions;
     delete from audit_logs;
     delete from facilities;
     delete from facility_categories;
@@ -850,12 +851,6 @@ async function clearAll(tx: Queryable): Promise<void> {
  * casting makes the intent explicit and the failure impossible.
  */
 export async function seedDatabase(): Promise<void> {
-  const passwordHash = bcrypt.hashSync(DEMO_PASSWORD, BCRYPT_ROUNDS)
-  // A distinct hash for the second representative proves that two accounts with
-  // the same password do not share a hash, which a shared-hash shortcut would
-  // hide. Worth the 100ms.
-  const secondHash = bcrypt.hashSync(DEMO_PASSWORD, BCRYPT_ROUNDS)
-
   // A booking snapshots the buffer its facility had at the time, and the
   // database enforces that the widened window matches. Seeding therefore has to
   // compute the same window the booking service would.
@@ -876,9 +871,9 @@ export async function seedDatabase(): Promise<void> {
     // --- profiles ---------------------------------------------------------
     for (const user of seedUsers) {
       await tx.execute(
-        `insert into profiles (id, email, display_name, password_hash, role, department)
-         values (@id, @email, @displayName, @passwordHash, @role, @department)`,
-        { ...user, passwordHash: user.id === 'user-rep-cynthia' ? secondHash : passwordHash },
+        `insert into profiles (id, email, display_name, role, department)
+         values (@id, @email, @displayName, @role, @department)`,
+        { ...user },
       )
     }
 
@@ -988,7 +983,6 @@ async function main(): Promise<void> {
   await waitForDatabase()
 
   console.log(`Seeding: ${redactDatabaseUrl(config.databaseUrl)}`)
-  console.log(`Demo password for all accounts: ${DEMO_PASSWORD}`)
   console.log(`         (${DEMO_EMAIL_DOMAIN} addresses are reserved and cannot receive mail)`)
 
   await seedDatabase()

@@ -14,7 +14,7 @@
 import { useState } from 'react'
 import { Link, useParams } from 'react-router-dom'
 
-import { useAuth } from '../auth/AuthContext'
+import { useIdentity } from '../identity/IdentityContext'
 import { api } from '../lib/api'
 import { mayBook, POLICY_LABELS, whyCannotBook } from '../lib/roles'
 import { addDays, formatLocalDateLong, formatTime, formatTimeRange, todayLocalDate, weekdayName } from '../lib/time'
@@ -32,7 +32,7 @@ import {
 
 export function FacilityDetailPage(): JSX.Element {
   const { id = '' } = useParams()
-  const { user } = useAuth()
+  const { user } = useIdentity()
 
   const [date, setDate] = useState(todayLocalDate())
 

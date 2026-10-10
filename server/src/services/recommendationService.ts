@@ -34,7 +34,7 @@ import {
   toLocalDateString,
   type LocalDateString,
 } from '../lib/time.ts'
-import type { AuthenticatedUser } from './sessionService.ts'
+import type { AuthenticatedUser } from './identityService.ts'
 import { evaluateBookingRequest } from './bookingService.ts'
 import { listFacilities, type FacilityRecord } from './facilityService.ts'
 

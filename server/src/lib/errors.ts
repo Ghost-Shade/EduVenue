@@ -16,7 +16,6 @@
 
 export type ApiErrorCode =
   | 'VALIDATION_FAILED'
-  | 'UNAUTHENTICATED'
   | 'FORBIDDEN'
   | 'NOT_FOUND'
   | 'CONFLICT'
@@ -27,6 +26,14 @@ export type ApiErrorCode =
   | 'SUPERVISION_REQUIRED'
   | 'CANCELLATION_NOT_PERMITTED'
   | 'INTERNAL_ERROR'
+
+// There is no UNAUTHENTICATED code and no 401, and that is not an omission.
+// Authentication was removed rather than disabled (see services/identityService.ts),
+// so no request can be unauthenticated: every one arrives with an identity
+// attached, chosen by the caller or defaulted. Keeping a 401 helper around would
+// have left the API looking as though it guarded something it does not.
+// A role that may not perform an action is still refused, with 403 FORBIDDEN -
+// that is authorization, and it is enforced exactly as before.
 
 export interface ApiErrorDetail {
   field?: string
@@ -56,10 +63,6 @@ export class ApiError extends Error {
 
 export function badRequest(message: string, details?: ApiErrorDetail[]): ApiError {
   return new ApiError(400, 'VALIDATION_FAILED', message, details)
-}
-
-export function unauthenticated(message = 'You must sign in to do that.'): ApiError {
-  return new ApiError(401, 'UNAUTHENTICATED', message)
 }
 
 export function forbidden(message = 'You do not have permission to do that.'): ApiError {

@@ -9,7 +9,7 @@
 import { useState, type FormEvent } from 'react'
 import { Link, useLocation, useParams } from 'react-router-dom'
 
-import { useAuth } from '../auth/AuthContext'
+import { useIdentity } from '../identity/IdentityContext'
 import { api, ApiError } from '../lib/api'
 import { describeDay, formatDuration, formatInstant, formatTimeRange, isPast } from '../lib/time'
 import { useResource } from '../hooks/useResource'
@@ -30,7 +30,7 @@ interface LocationState {
 
 export function BookingDetailPage(): JSX.Element {
   const { id = '' } = useParams()
-  const { user } = useAuth()
+  const { user } = useIdentity()
   const location = useLocation()
 
   const justCreated = (location.state as LocationState | null)?.justCreated === true

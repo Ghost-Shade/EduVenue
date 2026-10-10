@@ -23,7 +23,7 @@
 import { useEffect, useState, type FormEvent } from 'react'
 import { Link } from 'react-router-dom'
 
-import { useAuth } from '../auth/AuthContext'
+import { useIdentity } from '../identity/IdentityContext'
 import { api, ApiError } from '../lib/api'
 import { addDays, formatDuration, formatLocalDateLong, todayLocalDate } from '../lib/time'
 import type { Category, RecommendationResult } from '../lib/types'
@@ -39,7 +39,7 @@ import {
 } from '../components/ui'
 
 export function SuggestPage(): JSX.Element {
-  const { user } = useAuth()
+  const { user } = useIdentity()
 
   const [date, setDate] = useState(addDays(todayLocalDate(), 1))
   const [startTime, setStartTime] = useState('09:00')
@@ -118,8 +118,8 @@ export function SuggestPage(): JSX.Element {
 
       {!canBook ? (
         <Notice>
-          You are signed in as a {user?.role}. You can search and see the reasoning, but booking is
-          limited to class representatives and supervisors.
+          You are acting as a {user?.role}. You can search and see the reasoning, but booking is
+          limited to class representatives and supervisors. Switch identity in the header to book.
         </Notice>
       ) : null}
 

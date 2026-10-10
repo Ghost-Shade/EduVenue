@@ -43,14 +43,12 @@ import {
   parseOrThrow,
   recommendationSchema,
 } from '../lib/validation.ts'
-import { currentUser, requireAuth, requireMinRole } from '../middleware/auth.ts'
+import { currentActor, requireMinRole } from '../middleware/identity.ts'
 import { asyncHandler } from '../middleware/errorHandler.ts'
 import { getBookingOrThrow, createBooking, cancelBooking, listBookingsForUser, type BookingScope } from '../services/bookingService.ts'
 import { recommendFacilities } from '../services/recommendationService.ts'
 
 export const bookingsRouter = Router()
-
-bookingsRouter.use(requireAuth)
 
 const SCOPES: BookingScope[] = ['upcoming', 'past', 'all']
 
@@ -68,7 +66,7 @@ bookingsRouter.post(
   asyncHandler(async (req, res) => {
     const input = parseOrThrow(recommendationSchema, req.body, badRequest)
 
-    const result = await recommendFacilities(currentUser(req), {
+    const result = await recommendFacilities(currentActor(req), {
       date: input.date,
       startTime: input.startTime,
       endTime: input.endTime,
@@ -95,7 +93,7 @@ bookingsRouter.get(
       ])
     }
 
-    const bookings = await listBookingsForUser(currentUser(req).id, scope as BookingScope)
+    const bookings = await listBookingsForUser(currentActor(req).id, scope as BookingScope)
 
     res.json({ bookings, scope, count: bookings.length })
   }),
@@ -109,7 +107,7 @@ bookingsRouter.post(
 
     // Every rule is enforced inside this call, inside one transaction. A
     // rejection leaves no partial booking behind.
-    const booking = await createBooking(currentUser(req), input)
+    const booking = await createBooking(currentActor(req), input)
 
     res.status(201).json({ booking })
   }),
@@ -119,7 +117,7 @@ bookingsRouter.get(
   '/:id',
   asyncHandler(async (req, res) => {
     const booking = await getBookingOrThrow(req.params.id)
-    const actor = currentUser(req)
+    const actor = currentActor(req)
 
     // Someone else's booking is reported as NOT FOUND rather than forbidden, so
     // that the response does not confirm the existence of another person's
@@ -137,7 +135,7 @@ bookingsRouter.post(
   asyncHandler(async (req, res) => {
     const input = parseOrThrow(bookingCancelSchema, req.body ?? {}, badRequest)
 
-    const booking = await cancelBooking(currentUser(req), req.params.id, input)
+    const booking = await cancelBooking(currentActor(req), req.params.id, input)
 
     res.json({ booking })
   }),

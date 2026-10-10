@@ -10,11 +10,11 @@ import { Link } from 'react-router-dom'
 
 import { mayBook, whyCannotBook } from '../lib/roles'
 import type { Facility } from '../lib/types'
-import { useAuth } from '../auth/AuthContext'
+import { useIdentity } from '../identity/IdentityContext'
 import { FacilityStatusBadge, Tag } from './ui'
 
 export function FacilityCard({ facility }: { facility: Facility }): JSX.Element {
-  const { user } = useAuth()
+  const { user } = useIdentity()
 
   const bookable = mayBook(user, facility)
   const reason = whyCannotBook(user, facility)

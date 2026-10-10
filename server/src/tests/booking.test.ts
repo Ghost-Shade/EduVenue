@@ -30,7 +30,7 @@
  * ===========================================================================
  *
  * Every database call is a network round trip now. `prepareTestDatabase()` and
- * `signInAs()` are awaited at module load, and each test body is `async`. That
+ * `actAs()` are awaited at module load, and each test body is `async`. That
  * is not decoration: a test that forgot to await a booking would assert against
  * a pending Promise and pass while checking nothing.
  */
@@ -49,21 +49,21 @@ import {
   type CreateBookingInput,
 } from '../services/bookingService.ts'
 import {
+  actAs,
   allocateOpenDate,
   localDateBounds,
   localWeekday,
   prepareTestDatabase,
-  signInAs,
   TEST_USER_IDS,
 } from './harness.ts'
 
 await prepareTestDatabase()
 
-const rep = await signInAs(TEST_USER_IDS.rep)
-const rep2 = await signInAs(TEST_USER_IDS.rep2)
-const admin = await signInAs(TEST_USER_IDS.admin)
-const supervisor = await signInAs(TEST_USER_IDS.supervisor)
-const student = await signInAs(TEST_USER_IDS.student)
+const rep = await actAs(TEST_USER_IDS.rep)
+const rep2 = await actAs(TEST_USER_IDS.rep2)
+const admin = await actAs(TEST_USER_IDS.admin)
+const supervisor = await actAs(TEST_USER_IDS.supervisor)
+const student = await actAs(TEST_USER_IDS.student)
 
 const lectureHallA = await getFacilityOrThrow('fac-lecture-hall-a')
 const computingLabA = await getFacilityOrThrow('fac-computing-lab-a')
@@ -165,9 +165,8 @@ describe('a booking that satisfies every rule', () => {
     const metadata = entry.metadata as Record<string, unknown>
     assert.equal(metadata['reference'], booking.reference)
 
-    // The purpose and times are recorded; no credential or personal detail is.
-    assert.ok(!('password' in metadata))
-    assert.ok(!('password_hash' in metadata))
+    // The purpose and times are recorded; nothing beyond the booking is.
+    assert.equal(typeof metadata['activityPurpose'], 'string')
   })
 })
 

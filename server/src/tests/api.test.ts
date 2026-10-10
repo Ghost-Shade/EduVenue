@@ -7,7 +7,7 @@
  *
  * booking.test.ts calls the booking service directly, which proves the rules.
  * These tests prove the rules are actually reachable through the API and that
- * the guards in front of them hold: session resolution, the role gates on the
+ * the guards in front of them hold: identity resolution, the role gates on the
  * routes, the error shape the client parses, and the fact that a student
  * reaching the endpoint by hand still gets nothing.
  *
@@ -42,16 +42,15 @@ import { after, before, describe, test } from 'node:test'
 
 import './env.ts'
 import { combineLocalDateTimeToUtc } from '../lib/time.ts'
-import { DEMO_PASSWORD } from '../db/seed.ts'
 import { queryOne } from '../db/connection.ts'
 import { getFacilityOrThrow } from '../services/facilityService.ts'
 import {
+  actAs,
   allocateOpenDate,
   apiRequest,
   errorCode,
+  identityCookieFrom,
   prepareTestDatabase,
-  sessionCookieFrom,
-  signInAs,
   startTestServer,
   type HttpResponse,
   type TestServer,
@@ -61,9 +60,9 @@ await prepareTestDatabase()
 
 const lectureHallA = await getFacilityOrThrow('fac-lecture-hall-a')
 
-const rep = await signInAs('user-rep-brian')
-const rep2 = await signInAs('user-rep-cynthia')
-const student = await signInAs('user-student')
+const rep = await actAs('user-rep-brian')
+const rep2 = await actAs('user-rep-cynthia')
+const student = await actAs('user-student')
 
 let server: TestServer
 
@@ -94,77 +93,141 @@ function bookingBody(overrides: Record<string, unknown> = {}): Record<string, un
   }
 }
 
-describe('authentication', () => {
-  test('serves a health check without a session', async () => {
+describe('identity', () => {
+  test('serves a health check without any cookie', async () => {
     const response = await apiRequest(server, '/api/health')
 
     assert.equal(response.status, 200)
     assert.deepEqual(response.body, { status: 'ok', service: 'eduvenue-api' })
   })
 
-  test('refuses to list facilities without a session', async () => {
-    const response = await apiRequest(server, '/api/facilities')
+  test('acts as the default identity when no cookie is sent', async () => {
+    const response = await apiRequest(server, '/api/identity')
 
-    assert.equal(response.status, 401)
-    assert.equal(codeOf(response), 'UNAUTHENTICATED')
-  })
+    assert.equal(response.status, 200)
 
-  test('signs in with a demo account and resolves the session on later requests', async () => {
-    const login = await apiRequest(server, '/api/auth/login', {
-      method: 'POST',
-      body: { email: 'rep.brian@eduvenue.test', password: DEMO_PASSWORD },
-    })
+    const body = response.body as {
+      user: { id: string; role: string }
+      identities: Array<{ id: string; role: string; roleLabel: string }>
+    }
 
-    assert.equal(login.status, 200)
-
-    const cookie = sessionCookieFrom(login)
-    assert.match(cookie, /^eduvenue_session=/, 'a session cookie should be set')
-
-    const me = await apiRequest(server, '/api/auth/me', { cookie })
-
-    assert.equal(me.status, 200)
-    const body = me.body as { user: { email: string; role: string } }
-    assert.equal(body.user.email, 'rep.brian@eduvenue.test')
+    // There is no sign-in step, so a request with no cookie is NOT an error:
+    // it is the default identity, which is a representative because that is the
+    // role the application is about.
+    assert.equal(body.user.id, 'user-rep-brian')
     assert.equal(body.user.role, 'rep')
+
+    // Every role is offered, so a judge can try each one without credentials.
+    const roles = new Set(body.identities.map((identity) => identity.role))
+    assert.deepEqual(
+      [...roles].sort(),
+      ['admin', 'rep', 'student', 'supervisor'],
+      'the switcher should offer one identity of every role',
+    )
+    assert.ok(body.identities.every((identity) => identity.roleLabel.length > 0))
   })
 
-  test('gives the same answer for an unknown account and a wrong password', async () => {
-    const unknown = await apiRequest(server, '/api/auth/login', {
+  test('switches identity, and the new role governs the next request', async () => {
+    const switched = await apiRequest(server, '/api/identity', {
       method: 'POST',
-      body: { email: 'nobody@eduvenue.test', password: DEMO_PASSWORD },
+      body: { userId: 'user-student' },
     })
 
-    const wrongPassword = await apiRequest(server, '/api/auth/login', {
+    assert.equal(switched.status, 200)
+
+    const cookie = identityCookieFrom(switched)
+    assert.match(cookie, /^eduvenue_actor=user-student$/)
+
+    const whoAmI = await apiRequest(server, '/api/identity', { cookie })
+    assert.equal((whoAmI.body as { user: { role: string } }).user.role, 'student')
+
+    // The point of switching: the role is not decoration. A student is refused
+    // at the booking route, exactly as a signed-in student always was.
+    const booking = await apiRequest(server, '/api/bookings', {
       method: 'POST',
-      body: { email: 'rep.brian@eduvenue.test', password: 'not-the-password' },
+      cookie,
+      body: bookingBody(),
     })
 
-    assert.equal(unknown.status, 401)
-    assert.equal(wrongPassword.status, 401)
-
-    // Identical wording, so the response cannot be used to discover which
-    // addresses have accounts.
-    assert.deepEqual(unknown.body, wrongPassword.body)
+    assert.equal(booking.status, 403)
+    assert.equal(codeOf(booking), 'FORBIDDEN')
   })
 
-  test('revokes the session on sign-out', async () => {
-    const login = await apiRequest(server, '/api/auth/login', {
+  test('a representative with no cookie can still book', async () => {
+    // The end-to-end statement of "no login step": the default identity is a
+    // representative, so a bare request books. This is the behaviour the whole
+    // change was for, and it is worth one test that proves it through HTTP
+    // rather than by reading the default constant.
+    const date = allocateOpenDate(lectureHallA)
+
+    const response = await apiRequest(server, '/api/bookings', {
       method: 'POST',
-      body: { email: 'rep.brian@eduvenue.test', password: DEMO_PASSWORD },
+      body: {
+        facilityId: lectureHallA.id,
+        activityPurpose: 'Revision session',
+        expectedAttendance: 30,
+        date,
+        startTime: '13:00',
+        endTime: '14:00',
+      },
     })
 
-    const cookie = sessionCookieFrom(login)
+    assert.equal(response.status, 201)
+    const booking = (response.body as { booking: { status: string; bookedById: string } }).booking
+    assert.equal(booking.status, 'confirmed')
+    assert.equal(booking.bookedById, 'user-rep-brian')
+  })
 
-    const logout = await apiRequest(server, '/api/auth/logout', { method: 'POST', cookie })
-    assert.equal(logout.status, 204)
+  test('rejects an identity that does not exist, rather than appearing to switch', async () => {
+    const response = await apiRequest(server, '/api/identity', {
+      method: 'POST',
+      body: { userId: 'user-does-not-exist' },
+    })
 
-    // The same cookie is now worthless.
-    const after = await apiRequest(server, '/api/auth/me', { cookie })
-    assert.equal(after.status, 200)
-    assert.deepEqual(after.body, { user: null })
+    assert.equal(response.status, 400)
+    assert.equal(codeOf(response), 'VALIDATION_FAILED')
+  })
 
-    const protectedCall = await apiRequest(server, '/api/facilities', { cookie })
-    assert.equal(protectedCall.status, 401)
+  test('falls back to the default when the cookie names a profile that is gone', async () => {
+    // A re-seed resets the demo ids' contents but not a browser's cookie, and
+    // this must not produce a broken empty state. The fallback is silent in the
+    // response and logged on the server - see resolveActor.
+    const response = await apiRequest(server, '/api/identity', {
+      cookie: 'eduvenue_actor=user-deleted-long-ago',
+    })
+
+    assert.equal(response.status, 200)
+    assert.equal((response.body as { user: { id: string } }).user.id, 'user-rep-brian')
+  })
+
+  test('clears the chosen identity on DELETE, returning to the default', async () => {
+    const switched = await apiRequest(server, '/api/identity', {
+      method: 'POST',
+      body: { userId: 'user-admin' },
+    })
+
+    const cookie = identityCookieFrom(switched)
+
+    const reset = await apiRequest(server, '/api/identity', { method: 'DELETE', cookie })
+
+    assert.equal(reset.status, 200)
+    assert.equal((reset.body as { user: { id: string } }).user.id, 'user-rep-brian')
+
+    const afterwards = await apiRequest(server, '/api/identity', { cookie })
+    assert.equal((afterwards.body as { user: { id: string } }).user.id, 'user-rep-brian')
+  })
+
+  test('has no login route at all', async () => {
+    // Asserted rather than assumed: a leftover route accepting an email and a
+    // password would be the most dangerous possible artefact of this change -
+    // it would look like authentication while checking nothing.
+    const response = await apiRequest(server, '/api/auth/login', {
+      method: 'POST',
+      body: { email: 'rep.brian@eduvenue.test', password: 'anything' },
+    })
+
+    assert.equal(response.status, 404)
+    assert.equal(codeOf(response), 'NOT_FOUND')
   })
 })
 
@@ -196,7 +259,7 @@ describe('the facility directory', () => {
       .filters
     assert.equal(studentFilters.includeInactive, false)
 
-    const admin = await signInAs('user-admin')
+    const admin = await actAs('user-admin')
     const adminAsking = await apiRequest(server, '/api/facilities?includeInactive=true', {
       cookie: admin.cookie,
     })
@@ -415,16 +478,11 @@ describe('authorization on the booking route', () => {
     assert.equal(codeOf(response), 'FORBIDDEN')
   })
 
-  test('refuses an anonymous caller', async () => {
-    const response = await apiRequest(server, '/api/bookings', {
-      method: 'POST',
-      body: bookingBody(),
-    })
-
-    assert.equal(response.status, 401)
-    assert.equal(codeOf(response), 'UNAUTHENTICATED')
-  })
-
+  // There is deliberately no "refuses an anonymous caller" test any more. There
+  // is no anonymous caller: a request with no cookie acts as the default
+  // representative, which the identity block above asserts directly. The guard
+  // that mattered - a student is refused - is the test above, and it still holds
+  // because the role comes from the profile rather than from the interface.
   test('does not expose another representative’s booking by id', async () => {
     const created = await apiRequest(server, '/api/bookings', {
       method: 'POST',
@@ -443,7 +501,7 @@ describe('authorization on the booking route', () => {
     assert.equal(asOther.status, 404)
     assert.equal(codeOf(asOther), 'NOT_FOUND')
 
-    const adminSession = await signInAs('user-admin')
+    const adminSession = await actAs('user-admin')
     const asAdmin = await apiRequest(server, `/api/bookings/${bookingId}`, {
       cookie: adminSession.cookie,
     })

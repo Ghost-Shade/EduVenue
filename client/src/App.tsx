@@ -1,25 +1,31 @@
 /**
  * Routing.
  *
- * The structure encodes the access rule in one place: `/login` is the only
- * public route, and everything else sits behind `RequireAuth`, then inside the
- * shared `Layout`. A new page cannot be added without deciding which side of
- * that line it belongs on.
+ * There is no `/login` route any more, and that is the visible half of removing
+ * authentication: the application opens straight into the dashboard as a class
+ * representative, with the identity switcher in the header. See
+ * identity/IdentityContext.tsx and services/identityService.ts.
+ *
+ * `IdentityGate` holds the interface back until the server has said WHO is
+ * acting, then renders the shared `Layout`. So the structure still encodes one
+ * decision in one place: a new page cannot be added without passing through the
+ * layout, and every page is therefore written on the assumption that an identity
+ * exists. That assumption is now true - the server always has one to report -
+ * which is why the pages below no longer need a sign-in fallback.
  *
  * As everywhere in this client, this is a routing decision, not a security
- * boundary. The API refuses unauthenticated requests itself.
+ * boundary. The API enforces the role rules itself.
  */
 import { BrowserRouter, Route, Routes } from 'react-router-dom'
 
-import { AuthProvider } from './auth/AuthContext'
 import { Layout } from './components/Layout'
-import { RequireAuth } from './components/RequireAuth'
+import { IdentityGate } from './components/IdentityGate'
+import { IdentityProvider } from './identity/IdentityContext'
 import { BookFacilityPage } from './pages/BookFacilityPage'
 import { BookingDetailPage } from './pages/BookingDetailPage'
 import { DashboardPage } from './pages/DashboardPage'
 import { DirectoryPage } from './pages/DirectoryPage'
 import { FacilityDetailPage } from './pages/FacilityDetailPage'
-import { LoginPage } from './pages/LoginPage'
 import { MyBookingsPage } from './pages/MyBookingsPage'
 import { NotFoundPage } from './pages/NotFoundPage'
 import { SuggestPage } from './pages/SuggestPage'
@@ -27,11 +33,9 @@ import { SuggestPage } from './pages/SuggestPage'
 export default function App(): JSX.Element {
   return (
     <BrowserRouter>
-      <AuthProvider>
+      <IdentityProvider>
         <Routes>
-          <Route path="/login" element={<LoginPage />} />
-
-          <Route element={<RequireAuth />}>
+          <Route element={<IdentityGate />}>
             <Route element={<Layout />}>
               <Route index element={<DashboardPage />} />
               <Route path="facilities" element={<DirectoryPage />} />
@@ -44,7 +48,7 @@ export default function App(): JSX.Element {
             </Route>
           </Route>
         </Routes>
-      </AuthProvider>
+      </IdentityProvider>
     </BrowserRouter>
   )
 }

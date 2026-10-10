@@ -13,6 +13,11 @@ runnable local application: one command seeds a demonstration campus, one comman
 the API and the web client together. It runs on PostgreSQL, and the same code deploys to
 Vercel as two services — a static client and the API — backed by a hosted Postgres.
 
+**There is no sign-in.** The application opens as a class representative and a switcher in
+the header lets you act as any other demo identity, including the administrator. This is
+role *simulation*, not authentication — see [Demo identities](#demo-identities-no-sign-in)
+and [Honesty notes](#honesty-notes), which state plainly what that removes.
+
 > **Demonstration data only.** Every facility, capacity, opening hours and booking in this
 > repository is invented sample data. None of it describes Maseno University's real
 > venues, and this application is not connected to any university system. See
@@ -26,7 +31,7 @@ Vercel as two services — a static client and the API — backed by a hosted Po
 - [The one rule that matters](#the-one-rule-that-matters)
 - [Quick start (Windows PowerShell)](#quick-start-windows-powershell)
 - [Deploying to Vercel](#deploying-to-vercel)
-- [Demo accounts](#demo-accounts)
+- [Demo identities (no sign-in)](#demo-identities-no-sign-in)
 - [How the pieces fit](#how-the-pieces-fit)
 - [Tests](#tests)
 - [API surface](#api-surface)
@@ -58,8 +63,18 @@ Vercel as two services — a static client and the API — backed by a hosted Po
 | Supervisor | Everything a representative can, **plus** supervised facilities (laboratories). |
 | Facility administrator | Everything, plus cancelling any booking that has started. |
 
-There is no self-registration. An account's role is what makes a booking trustworthy, so
-accounts are issued rather than claimed.
+These roles are real **authorization**: the server refuses a booking from a student, refuses
+a supervised laboratory to a representative, and refuses another person's cancellation to
+everyone but its owner and an administrator. All of that is enforced on every request, from
+the `role` column of the profile being acted as.
+
+What is **not** enforced is that you are who you say you are. There is no password, no
+token and no session: a request names a profile and the server believes it. So the rules
+above decide *what a role may do*, not *who holds a role*. Anyone who can reach this
+application can act as the administrator. That is a deliberate scope reduction for a
+prototype holding invented data, it is stated again under
+[Honesty notes](#honesty-notes), and it is why there is no self-registration either — the
+identity list is the seed data.
 
 ## The one rule that matters
 
@@ -133,22 +148,21 @@ docker compose up -d
 # 3. Create your .env from the template
 Copy-Item .env.example .env
 
-# 4. Generate a real session secret and write it into .env
-$secret = -join ((1..64) | ForEach-Object { '{0:x}' -f (Get-Random -Max 16) })
-(Get-Content .env) -replace '^SESSION_SECRET=.*', "SESSION_SECRET=$secret" | Set-Content .env
-
-# 5. Create the schema and seed the demonstration data
+# 4. Create the schema and seed the demonstration data
 npm run db:reset
 
-# 6. Start the API and the web client together
+# 5. Start the API and the web client together
 npm run dev
 ```
 
-Then open **http://localhost:5173**.
+Then open **http://localhost:5173**. It opens straight into the dashboard as Brian Otieno,
+a class representative, with the identity switcher already in the header. There is no
+sign-in step, and no secret to generate: the only required setting is `DATABASE_URL`, which
+has a working local default.
 
 - The client runs on **5173** (Vite).
 - The API runs on **4000** (Express).
-- Vite proxies `/api` to the API, so the session cookie is same-origin. There is no CORS
+- Vite proxies `/api` to the API, so the identity cookie is same-origin. There is no CORS
   configuration anywhere, deliberately.
 - The database lives in a Docker volume, not a file in the repository. `docker compose
   down` stops it and keeps the data; `docker compose down -v` stops it and deletes the
@@ -189,20 +203,37 @@ kept deliberately small (5 by default), and the API does **no** database work at
 scope — the app is constructed at import time, and the connection is opened lazily on the
 first query. That keeps a cold start from waiting on Postgres.
 
-## Demo accounts
+## Demo identities (no sign-in)
 
-All demonstration accounts share the password **`Demo#Pass2026`**. They are listed on the
-sign-in page with one-click buttons while `ENABLE_DEMO_LOGINS=true`.
+Pick any of these from the **Acting as** control in the header. There is no password, no
+sign-in page and no signed-out state: the choice is sent to the server, which sets a small
+`httpOnly` cookie naming the profile, and every following request acts as that profile.
 
-| Email | Role | What to look at |
+| Identity | Role | What to look at |
 |---|---|---|
-| `student@eduvenue.test` | Student | Browse only — booking is refused |
-| `rep.brian@eduvenue.test` | Representative | Book a free slot, get it confirmed instantly |
-| `rep.cynthia@eduvenue.test` | Representative | The second person competing for the same room |
-| `supervisor@eduvenue.test` | Supervisor | A supervised laboratory that representatives cannot book |
-| `admin@eduvenue.test` | Administrator | Cancel a booking that has already started |
+| Brian Otieno | Representative | The default. Book a free slot, get it confirmed instantly |
+| Cynthia Wanjiru | Representative | The second person competing for the same room |
+| Dr. Esther Mbeki | Supervisor | A supervised laboratory that representatives cannot book |
+| Amina Okoth | Administrator | Cancel a booking that has already started |
+| David Kimani | Student | Browse only — booking is refused by the server |
 
-`eduvenue.test` is a reserved domain (RFC 2606) — these addresses cannot receive mail.
+The email addresses use the reserved `.test` domain (RFC 2606), so they cannot receive mail.
+
+**This is role simulation, not authentication.** There is no credential column, no session
+table and no login route — they were removed as one piece, because keeping any one of them
+alone would have looked like a security control while enforcing nothing. Two consequences
+worth stating plainly rather than leaving to be discovered:
+
+- Anyone who can reach the application can act as the administrator. The switcher is
+  enabled on the deployed demo URL as well as locally, deliberately, so a judge can try
+  every role without being handed credentials.
+- "Ownership" is therefore a real *rule* with an unverified *claim* behind it. Only Brian
+  can cancel Brian's booking — but any caller can say they are Brian. The rule is enforced;
+  the identity behind it is asserted, not proven.
+
+Cancellations of the seeded demonstration bookings are possible by anyone for that reason.
+Nothing in the database is real, so nothing real is at risk — which is the only condition
+under which this trade is acceptable.
 
 ## How the pieces fit
 
@@ -228,23 +259,24 @@ EduVenue/
 │       │   ├── roles.ts        Role hierarchy
 │       │   ├── errors.ts       Typed API errors
 │       │   └── validation.ts   Zod schemas
-│       ├── middleware/         Session, authorization, error handling
+│       ├── middleware/
+│       │   ├── identity.ts      Who is acting, and the role guards
+│       │   └── errorHandler.ts  asyncHandler, 404 and error responses
 │       ├── services/
 │       │   ├── bookingService.ts        The booking engine, and the dry-run evaluator
 │       │   ├── facilityService.ts       Directory + availability
 │       │   ├── recommendationService.ts The rules-based matcher
-│       │   ├── sessionService.ts        Server-side sessions
-│       │   ├── authService.ts           Password verification
+│       │   ├── identityService.ts       The acting identity, from a cookie or the default
 │       │   └── auditService.ts          Audit trail
-│       ├── routes/             auth, facilities, bookings
+│       ├── routes/             identity, facilities, bookings
 │       └── tests/              overlap, time, booking engine, API, database constraint
 └── client/                     React 18 + TypeScript + Vite + Tailwind
     └── src/
         ├── lib/                api client, types, time formatting, role helpers
-        ├── auth/               session context
-        ├── components/         layout, facility card, shared UI states
+        ├── identity/           the acting-identity context
+        ├── components/         layout + switcher, facility card, shared UI states
         ├── hooks/              useResource
-        └── pages/              login, dashboard, directory, facility, booking, suggest, bookings
+        └── pages/              dashboard, directory, facility, booking, suggest, bookings
 ```
 
 ### Why the recommendation engine shares the booking rules
@@ -275,7 +307,7 @@ is needed beyond it.
 | `src/tests/overlap.test.ts` | The overlap predicate in isolation: symmetry, containment, adjacency, buffers, gap subtraction, and the proof that the half-buffer form the constraint uses equals the full-buffer form the service uses |
 | `src/tests/time.test.ts` | Campus time: the fixed UTC+3 assumption *verified against `Intl`*, leap days, impossible dates, day boundaries |
 | `src/tests/booking.test.ts` | The rules through the real service: adjacency, all four overlap shapes, buffers, opening hours, closed days, blocks, capacity, activities, roles, cancellation, and that a rejected booking leaves nothing behind |
-| `src/tests/api.test.ts` | The whole request path over HTTP: sessions, role gates, error shapes, availability privacy, case-insensitive search, exact activity matching, and **eight simultaneous requests for one slot — exactly one confirmed** |
+| `src/tests/api.test.ts` | The whole request path over HTTP: identity switching and the default identity, role gates, error shapes, availability privacy, case-insensitive search, exact activity matching, and **eight simultaneous requests for one slot — exactly one confirmed** |
 | `src/tests/overlapConstraint.test.ts` | **The guarantee, against the database itself.** Writes overlapping rows with plain SQL, bypassing the service entirely, and asserts PostgreSQL refuses with SQLSTATE `23P01` — including the cases a service-layer test cannot reach: a cancelled row stops blocking, and a gap of exactly the buffer is accepted |
 
 The last one is the important one. Every other booking test exercises the code that is
@@ -294,15 +326,17 @@ testing a different system from the one that ships.
 
 ## API surface
 
-Every route is under `/api`. Nothing here is public except `/health` and `/auth/*`.
+Every route is under `/api`. Nothing here is public except `/health` and `/identity` — and
+"public" costs nothing to reach, because no route is behind a credential. What the routes
+*do* enforce is authorization: see the role table and the two paragraphs under
+[What it does](#what-it-does).
 
 | Method | Path | Notes |
 |---|---|---|
 | `GET` | `/api/health` | Liveness |
-| `POST` | `/api/auth/login` | Sets an httpOnly session cookie |
-| `POST` | `/api/auth/logout` | Revokes the session |
-| `GET` | `/api/auth/me` | `{ user: null }` when signed out |
-| `GET` | `/api/auth/demo-accounts` | Only when demo mode is enabled |
+| `GET` | `/api/identity` | The acting identity, plus every identity you can switch to |
+| `POST` | `/api/identity` | Switch to `{ "userId": "…" }`. Records the switch in the audit trail |
+| `DELETE` | `/api/identity` | Back to the default identity |
 | `GET` | `/api/facilities` | Filters: `q`, `categoryId`, `building`, `activity`, `minCapacity`, `sort`, `direction` |
 | `GET` | `/api/facilities/categories` | With active facility counts |
 | `GET` | `/api/facilities/buildings` | Distinct buildings |
@@ -336,20 +370,30 @@ Listed so the gaps are visible rather than discovered.
   schema enforces this, because "free at 02:00" is far more often a bug than a request.
 - **A CI pipeline.** `npm test` and `npm run typecheck` are the checks; nothing runs them
   automatically on push, so the test suite is a thing you run rather than a gate.
-- **Password change and reset.** Demo accounts only.
-- **Registration.** Deliberate — see [What it does](#what-it-does).
+- **Any authentication at all.** This is the largest gap, and it is deliberate. There is no
+  password, token, session or login route: a request names a profile and the server believes
+  it. Every rule below is still enforced against the role on that profile, so the *authorization*
+  is real — but a caller can claim any identity by sending one cookie, and the switcher in the
+  header is available on the deployed site. See [Honesty notes](#honesty-notes).
+- **Registration.** Deliberate — see [What it does](#what-it-does). With no authentication,
+  registration would mean nothing.
 
 ## Security notes
 
+**The honest summary first: this application does not authenticate anyone.** The brief asked
+for security as a core requirement, and the parts of it that depend on knowing who the caller
+is are no longer met. What follows says which controls are real and which were traded away,
+because a security section that reads confidently while the front door is open would be worse
+than no section at all.
+
+**Real controls — these hold regardless of authentication:**
+
 - **Authorization is server-side only.** Hiding a button is usability; the role guards in
-  `middleware/auth.ts` are the control. Every privileged route is guarded individually.
-- **Sessions are server-side and revocable.** The cookie holds an opaque random token;
-  the database stores only its SHA-256 hash. The cookie is `httpOnly` and `SameSite=Lax`,
-  and `secure` in production. Signing out revokes the row, so a stolen cookie is
-  worthless afterwards.
-- **Passwords** are hashed with bcrypt. An unknown email still performs a hash comparison
-  against a dummy value, so response timing does not reveal which addresses have accounts,
-  and the failure message is identical either way.
+  `middleware/identity.ts` are the control. Every privileged route is guarded individually,
+  and the role is read from the `profiles` row on each request, never from the client. A
+  student cannot book; a representative cannot book a supervised lab or touch someone else's
+  booking. Those refusals come from the server and would still come from the server if the
+  interface were bypassed entirely.
 - **Input is validated twice** — shape and range in Zod, business rules in the service
   layer — and every query binds parameters. No user input is concatenated into SQL; LIKE
   wildcards in search terms are escaped so a search for `%` is a literal search.
@@ -361,10 +405,39 @@ Listed so the gaps are visible rather than discovered.
 - **Availability is privacy-conscious.** Responses say that a room is taken and for what,
   but never who booked it — that is not needed to schedule, and it is not collected.
 - **Secrets live in `.env`**, which `.gitignore` excludes. `.env.example` contains
-  placeholders only. `SESSION_SECRET` is validated at boot: missing, short or still the
-  template value stops the server with an instruction rather than a stack trace.
-- **Auditability.** Logins, failed logins, bookings and cancellations are recorded with
-  the actor, the action and non-sensitive context. Credentials are never recorded.
+  placeholders only, and there are no credentials in this repository to leak — not because
+  they are hidden, but because the application has none. The one secret that remains is
+  `DATABASE_URL`, injected in production by the Vercel/Neon integration and never committed.
+- **Auditability.** Bookings, cancellations and identity switches are recorded with the
+  actor, the action and non-sensitive context. There are no credentials to record, because
+  none are presented.
+
+**Traded away — the identity claim itself:**
+
+- **There is no credential.** No password column, no session table, no login route. A
+  request carries one unsigned `httpOnly` cookie, `eduvenue_actor`, holding a profile id;
+  `identityService.resolveActor` reads it, falls back to the default identity when it is
+  missing or unrecognised, and logs a warning when it had to. Changing that cookie to any
+  other profile id changes who you are. Nothing is signed, and nothing could be — signing
+  needs a secret and a verified credential to sign.
+- **The audit trail says so.** An `identity.switched` entry records the *new* actor, the
+  previous one, and an explicit note that no credential was presented. The log is not
+  pretending the switch was a sign-in, so "who was acting when this happened" is still
+  reconstructable — it is just that "acting" is not "authenticated".
+- **The consequences are real, not theoretical.** Anyone who reaches the deployed site can
+  switch to the administrator identity and cancel a seeded booking. That is the intended
+  behaviour for a judged demo — every role is reachable without a handout — and it is the
+  reason this must never be pointed at real data.
+- **A missing actor is a 500, not a 401.** `attachActor` always sets `req.user`; if it has
+  not, that is a wiring bug in this codebase and not a property of the request, so it is
+  reported as a server fault. There is no `401` anywhere in the codebase, and no
+  `UNAUTHENTICATED` error code to return one — the API does not look as though it guards
+  something it does not.
+
+**If authentication were needed, the shape is known:** verify a credential, then sign the
+actor into the existing cookie, and have `resolveActor` reject instead of falling back. Every
+authorization decision already reads its role from the database, so those call sites would
+not change.
 
 ## Honesty notes
 
@@ -376,9 +449,16 @@ This project's own claims are held to the same standard as its code.
 - **The data is invented.** Facility names, capacities, equipment and schedules were
   written for this project. They are illustrative, and the interface says so on every
   page. No claim is made about Maseno University's actual venues or booking processes.
-- **Not production-ready.** It is a demonstration: no administrator screens, no CI, and
-  demo credentials that are deliberately public. Two claims worth separating from that
-  general one:
+- **There is no sign-in, and the switcher is public.** Authentication was removed as one
+  piece — password, session, login route and the credential column together — because
+  keeping any one of them would have left a security control that no longer controlled
+  anything. What remains is a role *simulation*: the server enforces authorization against
+  the real role on the profile, so a student is genuinely refused, but a caller can name any
+  profile. On the deployed site that means anyone, including a judge, can act as the
+  administrator. This is a deliberate trade for a demo, it is stated in the footer of every
+  page, and it means the brief's security requirement is partly unmet.
+- **Not production-ready.** It is a demonstration: no administrator screens, no CI, and no
+  authentication at all. Two claims worth separating from that general one:
   - The concurrency guarantee is now a **database constraint**, so it *does* hold across
     instances, hosts and regions. The single-process caveat the earlier SQLite build had
     is gone, and the [section above](#the-one-rule-that-matters) no longer hedges.
@@ -395,9 +475,6 @@ This project's own claims are held to the same standard as its code.
   test fails rather than bookings shifting by an hour.
 
 ## Troubleshooting
-
-**`SESSION_SECRET is not set`** — step 3 or 4 of the quick start was skipped. Create
-`.env` from `.env.example` and generate a secret.
 
 **`'concurrently' is not recognized`** — `npm run setup` has not been run, so the root
 dependencies are missing.

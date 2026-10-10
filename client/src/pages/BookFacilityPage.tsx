@@ -27,7 +27,7 @@ import { api, ApiError } from '../lib/api'
 import { mayBook, whyCannotBook } from '../lib/roles'
 import { addDays, formatLocalDateLong, todayLocalDate } from '../lib/time'
 import type { AlternativeSuggestion, Facility } from '../lib/types'
-import { useAuth } from '../auth/AuthContext'
+import { useIdentity } from '../identity/IdentityContext'
 import { useResource } from '../hooks/useResource'
 import {
   ErrorBanner,
@@ -52,7 +52,7 @@ interface ConflictDetails {
 export function BookFacilityPage(): JSX.Element {
   const { id = '' } = useParams()
   const navigate = useNavigate()
-  const { user } = useAuth()
+  const { user } = useIdentity()
   const [searchParams] = useSearchParams()
 
   const facility = useResource(() => api.facility(id), [id])

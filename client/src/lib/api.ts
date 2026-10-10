@@ -12,18 +12,17 @@
  * the server's role guards are the control.
  *
  * Cookies: the Vite dev server proxies `/api` to the API on port 4000, so the
- * browser sees one origin and the session cookie is sent normally. That is why
+ * browser sees one origin and the identity cookie is sent normally. That is why
  * there is no CORS configuration and no token juggling anywhere in this client.
  */
 import type {
   Availability,
   Booking,
   Category,
-  DemoAccounts,
   Facility,
   FacilityFilters,
+  IdentityState,
   RecommendationResult,
-  SessionUser,
 } from './types'
 
 /** A failure the API described deliberately. */
@@ -146,26 +145,28 @@ function queryString(params: Record<string, string | number | undefined>): strin
 }
 
 export const api = {
-  // --- session ----------------------------------------------------------
-  async login(email: string, password: string): Promise<SessionUser> {
-    const body = await request<{ user: SessionUser }>('/api/auth/login', {
+  // --- identity ---------------------------------------------------------
+  //
+  // There is no login, no logout and no token. The server always answers with
+  // who the caller is acting as - a chosen profile, or its own default - and the
+  // only mutation is choosing a different one. Naming these after identity
+  // rather than auth is deliberate: see services/identityService.ts.
+
+  async identity(): Promise<IdentityState> {
+    return request<IdentityState>('/api/identity')
+  },
+
+  /** Adopts another identity. The server sets the cookie; the client reports it. */
+  async switchIdentity(userId: string): Promise<IdentityState> {
+    return request<IdentityState>('/api/identity', {
       method: 'POST',
-      body: JSON.stringify({ email, password }),
+      body: JSON.stringify({ userId }),
     })
-    return body.user
   },
 
-  async logout(): Promise<void> {
-    await request<void>('/api/auth/logout', { method: 'POST' })
-  },
-
-  async me(): Promise<SessionUser | null> {
-    const body = await request<{ user: SessionUser | null }>('/api/auth/me')
-    return body.user
-  },
-
-  async demoAccounts(): Promise<DemoAccounts> {
-    return request<DemoAccounts>('/api/auth/demo-accounts')
+  /** Drops the chosen identity, returning to the server's default. */
+  async clearIdentity(): Promise<IdentityState> {
+    return request<IdentityState>('/api/identity', { method: 'DELETE' })
   },
 
   // --- directory --------------------------------------------------------

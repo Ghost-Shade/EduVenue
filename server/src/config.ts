@@ -3,10 +3,14 @@
  *
  * Design rule: fail loudly at startup, never at runtime.
  *
- * A missing SESSION_SECRET discovered when a user tries to log in at 3 AM is
- * far worse than a missing SESSION_SECRET discovered when the server boots. So
- * every requirement is checked here, once, with a message that says exactly
- * what to do about it.
+ * A missing DATABASE_URL discovered when a user tries to book at 3 AM is far
+ * worse than a missing DATABASE_URL discovered when the server boots. So every
+ * requirement is checked here, once, with a message that says exactly what to do
+ * about it.
+ *
+ * The database URL is now the ONLY required setting. There is no SESSION_SECRET,
+ * because there is nothing to sign: see services/identityService.ts for why the
+ * credential layer was removed rather than merely disabled.
  */
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -46,7 +50,6 @@ export interface AppConfig {
   isTest: boolean
 
   port: number
-  sessionSecret: string
 
   /** PostgreSQL connection string. Never logged directly - see redactDatabaseUrl. */
   databaseUrl: string
@@ -62,9 +65,6 @@ export interface AppConfig {
 
   /** Connection pool ceiling. Kept small: serverless instances multiply it. */
   databasePoolSize: number
-
-  /** Whether the demo-account shortcuts should be offered on the sign-in page. */
-  enableDemoLogins: boolean
 
   /** Built client assets, served by Express in production. */
   clientDistDir: string
@@ -100,39 +100,6 @@ function readPort(): number {
   }
 
   return port
-}
-
-function readSessionSecret(nodeEnv: NodeEnv): string {
-  const secret = process.env.SESSION_SECRET?.trim() ?? ''
-
-  // Tests never create real sessions, so the placeholder is tolerated there.
-  // Everywhere else a weak secret is a genuine vulnerability: it is the only
-  // thing preventing a forged session cookie.
-  if (nodeEnv === 'test' && secret === '') {
-    return 'test-only-secret-not-used-for-real-sessions'
-  }
-
-  if (secret === '') {
-    throw new ConfigurationError(
-      'SESSION_SECRET is not set. Copy .env.example to .env and generate one with:\n' +
-        "  PowerShell: -join ((1..64) | ForEach-Object { '{0:x}' -f (Get-Random -Max 16) })",
-    )
-  }
-
-  if (secret.length < 32) {
-    throw new ConfigurationError(
-      `SESSION_SECRET must be at least 32 characters to be worth signing with, received ${secret.length}. ` +
-        'Generate a longer one with the PowerShell command above.',
-    )
-  }
-
-  if (secret.startsWith('replace-me')) {
-    throw new ConfigurationError(
-      'SESSION_SECRET is still the placeholder value from .env.example. Generate a real one.',
-    )
-  }
-
-  return secret
 }
 
 function readDatabaseUrl(nodeEnv: NodeEnv): string {
@@ -212,11 +179,6 @@ function redact(value: string): string {
   return value.replace(/:\/\/([^:@/]+):[^@/]*@/, '://$1:****@')
 }
 
-function readBoolean(value: string | undefined, fallback: boolean): boolean {
-  if (value === undefined || value.trim() === '') return fallback
-  return ['1', 'true', 'yes', 'on'].includes(value.trim().toLowerCase())
-}
-
 function loadConfig(): AppConfig {
   const nodeEnv = readNodeEnv()
   const isProduction = nodeEnv === 'production'
@@ -227,13 +189,9 @@ function loadConfig(): AppConfig {
     isTest: nodeEnv === 'test',
 
     port: readPort(),
-    sessionSecret: readSessionSecret(nodeEnv),
     databaseUrl: readDatabaseUrl(nodeEnv),
     databaseSchema: readDatabaseSchema(nodeEnv),
     databasePoolSize: readDatabasePoolSize(),
-
-    // Demo logins are convenient but must never be silently on in production.
-    enableDemoLogins: isProduction ? false : readBoolean(process.env.ENABLE_DEMO_LOGINS, true),
 
     clientDistDir: path.join(REPO_ROOT, 'client', 'dist'),
     repoRoot: REPO_ROOT,

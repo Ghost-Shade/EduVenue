@@ -12,12 +12,12 @@
  * start even for a request that needs none.
  *
  * So this file only wires middleware and routes together. Everything that needs
- * the database - checking the schema is present, purging expired sessions,
- * listing the demo accounts - happens later, per request, or in index.ts where a
- * long-running process can reasonably wait for one.
+ * the database - checking the schema is present, resolving the acting identity -
+ * happens later, per request, or in index.ts where a long-running process can
+ * reasonably wait for one.
  *
  * Express serves BOTH the API under /api and, when a production build exists,
- * the compiled client. Serving them from one origin means the session cookie
+ * the compiled client. Serving them from one origin means the identity cookie
  * needs no CORS configuration and no `credentials: 'include'` juggling - the
  * browser treats it as an ordinary same-site cookie. (On Vercel the two are
  * separate services and Vite's dev server proxies instead, but the same-origin
@@ -30,7 +30,7 @@ import cookieParser from 'cookie-parser'
 import express, { type Express } from 'express'
 
 import { getConfig } from './config.ts'
-import { attachUser } from './middleware/auth.ts'
+import { attachActor } from './middleware/identity.ts'
 import { errorHandler, notFoundHandler } from './middleware/errorHandler.ts'
 import { createApiRouter } from './routes/index.ts'
 
@@ -71,9 +71,12 @@ export function createApp(): Express {
   // JSON parser is a trivial denial-of-service vector.
   app.use(express.json({ limit: '100kb' }))
 
-  // Decides who the caller is, if anyone. Fails a request whose session lookup
-  // cannot be completed, rather than quietly treating everyone as anonymous.
-  app.use(attachUser)
+  // Decides who the caller is acting as. This does NOT authenticate anybody -
+  // see services/identityService.ts - but it does fail the request when the
+  // lookup itself cannot be completed, rather than quietly defaulting every
+  // caller to the same identity and attributing their actions to the wrong
+  // person in the audit trail.
+  app.use(attachActor)
 
   // Deliberately does NOT touch the database: it answers "is this process
   // serving?" and nothing else, so it stays useful when everything else is

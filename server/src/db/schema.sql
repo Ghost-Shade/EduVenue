@@ -83,34 +83,32 @@ create table if not exists facility_categories (
 -- ---------------------------------------------------------------------------
 -- profiles
 --
--- Application users. `password_hash` holds a bcrypt hash, never a plaintext
--- password. `role` is read on every authorization decision and is NEVER
--- accepted from the client - see middleware/auth.ts.
+-- Application users. `role` is read on every authorization decision and is NEVER
+-- accepted from the client - see middleware/identity.ts. A request may choose
+-- WHICH profile it acts as; it may never choose a role.
+--
+-- NOTE: THERE IS NO CREDENTIAL COLUMN, and that is the current design rather
+-- than an oversight. This build has no authentication: the acting user is
+-- chosen from the demo list (see services/identityService.ts), so a profile is
+-- a label describing who you are pretending to be, not an account anyone proves
+-- they own. Anyone can act as anyone.
+--
+-- That is a deliberate, documented reduction in scope for a prototype holding
+-- invented data. It means `role` here is a SIMULATION of the role model the
+-- brief describes, not a security control: nothing prevents a caller from
+-- choosing the administrator. See the honesty notes in README.md. If this were
+-- ever to hold real data, the credential column, the session table and the
+-- login route would all have to come back together - they were removed as one
+-- piece, and half of them alone would be worse than none.
 -- ---------------------------------------------------------------------------
 create table if not exists profiles (
     id            text primary key,
     email         text not null unique,
     display_name  text not null check (length(trim(display_name)) > 0),
-    password_hash text not null,
     role          text not null default 'student'
                   check (role in ('student', 'rep', 'supervisor', 'admin')),
     department    text,
     created_at    timestamptz not null default now()
-);
-
--- ---------------------------------------------------------------------------
--- sessions
---
--- Server-side sessions. Only a SHA-256 hash of the cookie token is stored, so
--- a leaked database does not hand over live sessions. Sessions are revocable by
--- deleting the row, which JWTs cannot do without extra machinery.
--- ---------------------------------------------------------------------------
-create table if not exists sessions (
-    token_hash text primary key,
-    user_id    text not null references profiles (id) on delete cascade,
-    created_at timestamptz not null default now(),
-    expires_at timestamptz not null,
-    user_agent text
 );
 
 -- ---------------------------------------------------------------------------
@@ -372,12 +370,6 @@ create index if not exists facilities_category_idx
 
 create index if not exists facilities_status_idx
     on facilities (status);
-
-create index if not exists sessions_expires_idx
-    on sessions (expires_at);
-
-create index if not exists sessions_user_idx
-    on sessions (user_id);
 
 create index if not exists audit_created_idx
     on audit_logs (created_at desc);

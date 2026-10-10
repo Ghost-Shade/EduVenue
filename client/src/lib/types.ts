@@ -9,7 +9,14 @@
 
 export type UserRole = 'student' | 'rep' | 'supervisor' | 'admin'
 
-export interface SessionUser {
+/**
+ * The identity the interface is currently acting as.
+ *
+ * Called `CurrentUser` rather than `SessionUser` because there is no session:
+ * authentication was removed and the server simply reports which profile the
+ * caller has adopted. See services/identityService.ts on the API side.
+ */
+export interface CurrentUser {
   id: string
   email: string
   displayName: string
@@ -143,17 +150,28 @@ export interface RecommendationResult {
   problem: string | null
 }
 
-export interface DemoAccount {
+/** One selectable identity, for the switcher in the header. */
+export interface IdentityOption {
+  id: string
   email: string
   displayName: string
   role: UserRole
+  roleLabel: string
   department: string | null
 }
 
-export interface DemoAccounts {
-  accounts: DemoAccount[]
-  password: string | null
-  enabled: boolean
+/**
+ * The whole of `GET/POST/DELETE /api/identity`.
+ *
+ * `user` is non-null and the type says so: the server always has an identity to
+ * report, because an absent or unknown cookie resolves to a default rather than
+ * to a signed-out state. Only the client can be in a state without one, and that
+ * is during loading or after a failure to reach the server - which is why the
+ * context's `user` is nullable while this is not.
+ */
+export interface IdentityState {
+  user: CurrentUser
+  identities: IdentityOption[]
 }
 
 export interface FacilityFilters {

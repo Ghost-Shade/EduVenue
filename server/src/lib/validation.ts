@@ -29,15 +29,20 @@ const LOCAL_TIME = /^\d{2}:\d{2}$/
 const uuidLike = z.string().trim().min(1).max(64)
 
 // ---------------------------------------------------------------------------
-// Authentication
+// Identity
+//
+// There is no credential to validate, because there are no credentials - see
+// services/identityService.ts. The whole of the input is which profile the
+// caller wants to act as, and the only thing checkable about it here is its
+// shape; whether that profile EXISTS is a database question, answered in the
+// route.
 // ---------------------------------------------------------------------------
 
-export const loginSchema = z.object({
-  email: z.string().trim().toLowerCase().min(3).max(254),
-  password: z.string().min(1).max(200),
+export const identitySwitchSchema = z.object({
+  userId: uuidLike,
 })
 
-export type LoginInput = z.infer<typeof loginSchema>
+export type IdentitySwitchInput = z.infer<typeof identitySwitchSchema>
 
 // ---------------------------------------------------------------------------
 // Bookings

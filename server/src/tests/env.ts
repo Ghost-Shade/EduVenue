@@ -54,10 +54,9 @@ process.env['NODE_ENV'] = 'test'
 // what is already set.
 process.env['TEST_DATABASE_URL'] ??= LOCAL_TEST_DATABASE_URL
 
-// A literal secret rather than the empty-string shortcut in config.ts, so the
-// test run exercises the same code path a real environment does. It is not a
-// credential for anything: no test starts a server reachable off this machine.
-process.env['SESSION_SECRET'] = 'eduvenue-test-secret-no-real-sessions-use-this'
+// No SESSION_SECRET is set any more, and none is needed: authentication was
+// removed, so there is nothing to sign. A leftover value in a developer's .env
+// would simply be ignored - config.ts does not read it.
 
 /**
  * A schema name for this test file, matching the conservative identifier shape

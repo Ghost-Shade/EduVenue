@@ -9,10 +9,10 @@
  *   GET /api/facilities/:id                -> { facility }
  *   GET /api/facilities/:id/availability   -> { availability }
  *
- * THE DIRECTORY IS PUBLIC TO SIGNED-IN USERS ONLY. Browsing facilities is the
- * one thing a plain student may do, but it is still behind `requireAuth`: the
- * brief's role model has no anonymous audience, and an unauthenticated directory
- * would be a free inventory of university buildings on a public host.
+ * THE DIRECTORY IS OPEN TO EVERYONE. There is no role gate on browsing: every
+ * request arrives with an identity attached (the caller's chosen one, or the
+ * default), and looking at the directory is something every role may do. What is
+ * still enforced server-side is BOOKING, per facility, in the booking service.
  *
  * ROUTE ORDER MATTERS. `/categories`, `/buildings` and `/activities` are
  * declared BEFORE `/:id`, otherwise Express would match `/categories` as a
@@ -22,14 +22,11 @@ import { Router } from 'express'
 
 import { badRequest } from '../lib/errors.ts'
 import { availabilityQuerySchema, facilityQuerySchema, parseOrThrow } from '../lib/validation.ts'
-import { currentUser, requireAuth } from '../middleware/auth.ts'
+import { currentActor } from '../middleware/identity.ts'
 import { asyncHandler } from '../middleware/errorHandler.ts'
 import { getAvailability, listActivities, listBuildings, listCategories, getFacilityOrThrow, listFacilities } from '../services/facilityService.ts'
 
 export const facilitiesRouter = Router()
-
-// Everything in this router requires a session.
-facilitiesRouter.use(requireAuth)
 
 facilitiesRouter.get(
   '/',
@@ -43,7 +40,7 @@ facilitiesRouter.get(
     // confusion facilityService.ts is written to avoid. So it is ignored
     // rather than refused, and the effective filters are echoed back so the
     // client can see what was actually applied.
-    const isAdmin = currentUser(req).role === 'admin'
+    const isAdmin = currentActor(req).role === 'admin'
     const includeInactive = isAdmin && query.includeInactive === true
 
     const facilities = await listFacilities({

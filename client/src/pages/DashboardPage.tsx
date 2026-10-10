@@ -6,14 +6,14 @@
  */
 import { Link } from 'react-router-dom'
 
-import { useAuth } from '../auth/AuthContext'
+import { useIdentity } from '../identity/IdentityContext'
 import { api } from '../lib/api'
 import { describeDay, formatTimeRange, isToday } from '../lib/time'
 import { useResource } from '../hooks/useResource'
 import { BookingStatusBadge, ErrorBanner, Loading, Notice, buttonPrimary, buttonSecondary } from '../components/ui'
 
 export function DashboardPage(): JSX.Element {
-  const { user } = useAuth()
+  const { user } = useIdentity()
 
   const upcoming = useResource(() => api.myBookings('upcoming'), [])
 
@@ -123,8 +123,8 @@ export function DashboardPage(): JSX.Element {
             </li>
           ) : (
             <li className="text-campus-500">
-              • Booking is limited to class representatives. Sign in with a representative account
-              to make one.
+              • Booking is limited to class representatives. Switch to a representative identity
+              in the header to make one.
             </li>
           )}
           {canBook ? <li>• Cancel your own bookings while they are still upcoming.</li> : null}

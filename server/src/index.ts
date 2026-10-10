@@ -11,9 +11,8 @@
  * The application itself is built in app.ts, which is shared with the
  * serverless entrypoint (api/index.ts) and with the tests. Everything in THIS
  * file is about being a long-lived process: waiting for a database that may
- * still be starting, clearing stale sessions once at boot, and closing the pool
- * on a signal. None of that belongs in the app factory, and none of it runs on
- * Vercel.
+ * still be starting, and closing the pool on a signal. None of that belongs in
+ * the app factory, and none of it runs on Vercel.
  */
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -21,7 +20,6 @@ import { fileURLToPath } from 'node:url'
 import { createApp } from './app.ts'
 import { getConfig } from './config.ts'
 import { closePool, query, redactDatabaseUrl, waitForDatabase } from './db/connection.ts'
-import { purgeExpiredSessions } from './services/sessionService.ts'
 
 /**
  * Confirms the schema is present.
@@ -62,15 +60,6 @@ async function main(): Promise<void> {
 
   await assertDatabaseReady()
 
-  // Clear stale sessions at boot so the table does not grow without bound
-  // between logins. Done once here rather than per request; on the serverless
-  // entrypoint there is no boot to hook, so it is skipped there and expired rows
-  // simply age out of every query that reads them.
-  const purged = await purgeExpiredSessions()
-  if (purged > 0) {
-    console.log(`Removed ${purged} expired session(s).`)
-  }
-
   const app = createApp()
 
   const server = app.listen(config.port, () => {
@@ -79,14 +68,10 @@ async function main(): Promise<void> {
     console.log(`  http://localhost:${config.port}`)
     console.log(`  Database:   ${redactDatabaseUrl(config.databaseUrl)}`)
     console.log(`  Environment: ${config.nodeEnv}`)
-    console.log(`  Demo logins: ${config.enableDemoLogins ? 'enabled' : 'disabled'}`)
     console.log('')
+    console.log('  No sign-in: you act as a demo identity, switchable in the header.')
     console.log('  All facility data is illustrative sample data.')
     console.log('')
-
-    if (!config.enableDemoLogins) {
-      console.warn('  WARNING: demo logins are disabled but this is not production.')
-    }
   })
 
   let shuttingDown = false

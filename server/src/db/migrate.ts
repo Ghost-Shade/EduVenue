@@ -42,7 +42,6 @@ export const APPLICATION_TABLES = [
   'audit_logs',
   'bookings',
   'facility_blocks',
-  'sessions',
   'facilities',
   'facility_categories',
   'booking_reference_seq',

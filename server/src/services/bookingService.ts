@@ -84,7 +84,7 @@ import {
   isWithinOperatingHours,
   type LocalDateString,
 } from '../lib/time.ts'
-import type { AuthenticatedUser } from '../services/sessionService.ts'
+import type { AuthenticatedUser } from '../services/identityService.ts'
 import { recordAudit } from './auditService.ts'
 import { getFacilityOrThrow, type FacilityRecord } from './facilityService.ts'
 

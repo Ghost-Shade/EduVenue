@@ -30,7 +30,7 @@ import { fileURLToPath } from 'node:url'
 import { getConfig } from '../config.ts'
 import { closePool, redactDatabaseUrl, waitForDatabase } from './connection.ts'
 import { applySchema, dropAllTables, listIndexes, listTables } from './migrate.ts'
-import { DEMO_PASSWORD, seedDatabase } from './seed.ts'
+import { seedDatabase } from './seed.ts'
 
 /** Hosts that are certainly this machine. */
 const LOCAL_HOSTS = new Set(['localhost', '127.0.0.1', '::1', 'host.docker.internal'])
@@ -84,8 +84,9 @@ async function main(): Promise<void> {
     `Overlap constraint: ${hasOverlapConstraint ? 'installed (bookings_no_overlap)' : 'MISSING - this is a bug'}`,
   )
   console.log('')
-  console.log(`Demo password for all accounts: ${DEMO_PASSWORD}`)
   console.log('Reset complete.')
+  console.log('No sign-in: the application opens as Brian Otieno, a class representative.')
+  console.log('Every other demo identity is selectable from the switcher in the header.')
 
   if (!hasOverlapConstraint) {
     throw new Error(
